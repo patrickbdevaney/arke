@@ -81,7 +81,7 @@ SPORTS_KEYWORDS = [
     "Giants",
 ]
 
-DASHBOARD_URL = os.getenv("DASHBOARD_URL", "arke.markets")
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "arke.live")
 BUILDER_CODE = os.getenv("POLY_BUILDER_CODE", "")
 BUILDER_ADDR = os.getenv("POLY_BUILDER_ADDRESS", "")
 
