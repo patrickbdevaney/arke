@@ -214,6 +214,9 @@ class ArkeDB:
             ("skipped_markets", "skipped_at_ts", "INTEGER NOT NULL DEFAULT 0"),
             ("skipped_markets", "probability_pct", "INTEGER NOT NULL DEFAULT 0"),
             ("skipped_markets", "volume_24hr", "REAL NOT NULL DEFAULT 0"),
+            ("posted_markets", "arke_probability_pct", "INTEGER"),
+            ("posted_markets", "news_context", "TEXT NOT NULL DEFAULT ''"),
+            ("posted_markets", "divergence_pts", "INTEGER"),
         ]
         existing = {}
         for table, col, typedef in migrations:
@@ -297,6 +300,8 @@ class ArkeDB:
         quality_score: float = None,
         quality_passed: bool = True,
         arke_position: str = None,
+        arke_probability_pct: int = None,
+        news_context: str = "",
     ) -> int:
         """Record a successfully posted market. Returns the row id."""
         events = market.get("events", [])
@@ -307,6 +312,12 @@ class ArkeDB:
         lines = tweet_text.strip().split("\n")
         take_lines = [l for l in lines if not l.strip().startswith("Bet:")]
         take = "\n".join(take_lines).strip()
+
+        market_pct = int(float(market.get("lastTradePrice", 0)) * 100)
+        divergence_pts = (
+            arke_probability_pct - market_pct
+            if arke_probability_pct is not None else None
+        )
 
         now_iso = self._now_iso()
         now_ts = self._now_ts()
@@ -320,13 +331,15 @@ class ArkeDB:
                     end_date, spread, tweet_text, tweet_take, tweet_length,
                     opentweet_post_id, x_post_url, builder_code,
                     posted_at, posted_at_ts, quality_score, quality_passed,
-                    arke_position
+                    arke_position, arke_probability_pct, news_context,
+                    divergence_pts
                 ) VALUES (
                     ?, ?, ?, ?, ?,
                     ?, ?, ?, ?,
                     ?, ?, ?, ?, ?,
                     ?, ?, ?,
                     ?, ?, ?, ?,
+                    ?, ?, ?,
                     ?
                 )
                 """,
@@ -336,7 +349,7 @@ class ArkeDB:
                     market.get("slug", ""),
                     event_slug,
                     market_url,
-                    int(float(market.get("lastTradePrice", 0)) * 100),
+                    market_pct,
                     float(market.get("volume24hr", 0)),
                     float(market.get("volume", 0)),
                     float(market.get("liquidity", 0)),
@@ -353,6 +366,9 @@ class ArkeDB:
                     quality_score,
                     1 if quality_passed else 0,
                     arke_position,
+                    arke_probability_pct,
+                    (news_context or "")[:500],
+                    divergence_pts,
                 ),
             )
             return cursor.lastrowid

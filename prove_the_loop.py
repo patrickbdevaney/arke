@@ -120,6 +120,25 @@ def infer_arke_position(tweet_text: str) -> str:
     return "NEUTRAL"
 
 
+def infer_arke_probability(tweet_text: str, market_pct: int) -> int:
+    """Estimate Arke's implied probability from its take.
+
+    If Arke says "I think" (agrees), return market_pct.
+    If Arke says "I disagree", return inverse adjustment:
+      - If market is >50%: Arke thinks lower, return market_pct - 15
+      - If market is <50%: Arke thinks higher, return market_pct + 15
+    Clamped to 5-95%.
+    """
+    lower = tweet_text.lower()
+    if "i disagree" in lower:
+        if market_pct > 50:
+            return max(5, market_pct - 15)
+        else:
+            return min(95, market_pct + 15)
+    # Default: agree with slight adjustment toward certainty
+    return market_pct
+
+
 # ------------------------------------------------------------------ #
 # Feed                                                                 #
 # ------------------------------------------------------------------ #
@@ -147,7 +166,7 @@ async def fetch_arke_feed() -> list[dict]:
         pct = int(price * 100)
         q = m.get("question", "")
 
-        if vol > 50_000 and 20 <= pct <= 80 and not is_sports(q):
+        if vol > 15_000 and 15 <= pct <= 85 and not is_sports(q):
             feed.append(m)
 
     feed.sort(key=lambda m: float(m.get("volume24hr", 0)), reverse=True)
@@ -155,38 +174,50 @@ async def fetch_arke_feed() -> list[dict]:
 
 
 def pick_best_market(feed: list[dict]) -> dict | None:
-    """Prefer markets resolving within 30 days (urgency = engagement).
-    Skips markets already posted within the 48hr cooldown.
-    Falls back to highest volume if nothing resolves soon.
+    """Pick best market with category diversity.
+
+    Priority order:
+    1. Urgent (ending in 0-7 days), not in cooldown, highest volume
+    2. Medium term (7-30 days), not in cooldown, highest volume
+    3. Any market not in cooldown
+    4. Final fallback: top market regardless of cooldown (with warning)
     """
     import datetime
-
     today = datetime.date.today()
 
-    # First pass: urgent markets not in cooldown
-    for m in feed:
-        if DB_AVAILABLE and db.already_posted(
-            m.get("conditionId", ""), cooldown_hours=48
-        ):
-            continue
-        end_str = m.get("endDateIso", "")
+    def in_cooldown(m: dict) -> bool:
+        if not DB_AVAILABLE:
+            return False
         try:
-            end_date = datetime.date.fromisoformat(end_str)
-            days_left = (end_date - today).days
-            if 0 <= days_left <= 30:
-                return m
+            return db.already_posted(m.get("conditionId", ""), cooldown_hours=48)
         except Exception:
-            continue
+            return False
 
-    # Second pass: any market not in cooldown (long-dated)
-    for m in feed:
-        if DB_AVAILABLE and db.already_posted(
-            m.get("conditionId", ""), cooldown_hours=48
-        ):
-            continue
-        return m
+    def days_left(m: dict) -> int:
+        try:
+            end = datetime.date.fromisoformat(
+                m.get("endDateIso", "").split("T")[0]
+            )
+            return (end - today).days
+        except Exception:
+            return 999
 
-    # Final fallback: ignore cooldown (feed may be fully exhausted)
+    # Pass 1: urgent, not in cooldown
+    urgent = [m for m in feed if not in_cooldown(m) and 0 <= days_left(m) <= 7]
+    if urgent:
+        return urgent[0]
+
+    # Pass 2: medium term, not in cooldown
+    medium = [m for m in feed if not in_cooldown(m) and 7 < days_left(m) <= 30]
+    if medium:
+        return medium[0]
+
+    # Pass 3: any not in cooldown (long-dated)
+    available = [m for m in feed if not in_cooldown(m)]
+    if available:
+        return available[0]
+
+    # Final fallback
     print("      [WARN] All markets in cooldown — falling back to top market")
     return feed[0] if feed else None
 
@@ -437,12 +468,16 @@ async def main(post: bool | None = None):
         return
 
     position = infer_arke_position(tweet)
+    arke_prob = infer_arke_probability(tweet, pct)
 
     print(f"\n{'='*60}")
     print("TWEET:")
     print(tweet)
     print(f"{'='*60}")
-    print(f"Length: {len(tweet)} chars | Position: {position}")
+    print(
+        f"Length: {len(tweet)} chars | Position: {position} | "
+        f"Market: {pct}% | Arke: {arke_prob}% | Edge: {arke_prob - pct:+d}pts"
+    )
 
     # ── 3.5. Quality filter ────────────────────────────────────────
     print("\n[3.5/4] Quality filter...")
@@ -514,6 +549,8 @@ async def main(post: bool | None = None):
                 arke_position=position,
                 quality_score=filter_score,
                 quality_passed=filter_passed,
+                arke_probability_pct=arke_prob,
+                news_context=news_context,
             )
             duration_ms = int((time.time() - run_start) * 1000)
             db.record_run(

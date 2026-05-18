@@ -94,7 +94,7 @@ async def fetch_arke_feed() -> list[dict]:
         except (TypeError, ValueError):
             continue
 
-        if vol > 50_000 and 20 <= pct <= 80 and not is_sports(q):
+        if vol > 15_000 and 15 <= pct <= 85 and not is_sports(q):
             feed.append(m)
 
     feed.sort(key=lambda m: float(m.get("volume24hr", 0) or 0), reverse=True)
