@@ -196,7 +196,7 @@ def pick_best_market(feed: list[dict]) -> dict | None:
 # ------------------------------------------------------------------ #
 
 
-def generate_tweet(market: dict, groq_api_key: str) -> str:
+def generate_tweet(market: dict, groq_api_key: str, news_context: str = "") -> str:
     """Generate analytical tweet via Groq gpt-oss-120b."""
     client = Groq(api_key=groq_api_key)
 
@@ -213,13 +213,20 @@ def generate_tweet(market: dict, groq_api_key: str) -> str:
         meta = events[0].get("eventMetadata", {})
         context = meta.get("context_description", "")[:400]
 
+    news_block = ""
+    if news_context:
+        news_block = (
+            f"\n\nBreaking news context (CITE THIS in your take):\n{news_context}"
+            "\n\nYour take MUST reference one specific detail from the breaking news above."
+        )
+
     prompt = f"""You are Arke, an autonomous prediction market intelligence agent. You write sharp, analytical tweets that crypto-native traders respect and engage with.
 
 Market: {question}
 Current probability: {pct}% YES
 24hr volume: ${vol24:,.0f} USDC
 Resolves: {end_date}
-Context: {context}
+Context: {context}{news_block}
 
 TWEET STRUCTURE (follow exactly):
 Line 1: State the event and the market's implied probability as a fact. One sentence. End with a period.
@@ -381,10 +388,34 @@ async def main(post: bool | None = None):
                 if db.already_posted(m.get("conditionId", "")):
                     db.record_skip(m, "cooldown_48hr")
 
+    # ── 2.5. Fetch signal context ──────────────────────────────────
+    print("\n[2.5/4] Fetching signal context...")
+    news_context = ""
+    try:
+        from agent.integrations.signals import fetch_headlines
+        headlines = await fetch_headlines()
+        # Match headlines to market question
+        question_words = set(
+            w.lower() for w in market.get("question", "").split()
+            if len(w) > 4
+        )
+        relevant = []
+        for h in headlines:
+            title_words = set(h.get("title", "").lower().split())
+            if len(question_words & title_words) >= 2:
+                relevant.append(h["title"])
+        news_context = " | ".join(relevant[:3])
+        if news_context:
+            print(f"      Signal context: {news_context[:100]}...")
+        else:
+            print("      No relevant signals found — generating without context")
+    except Exception as e:
+        print(f"      Signal fetch failed: {e} — continuing without context")
+
     # ── 3. Generate tweet ──────────────────────────────────────────
     print("\n[3/4] Generating tweet...")
     try:
-        tweet = generate_tweet(market, groq_key)
+        tweet = generate_tweet(market, groq_key, news_context=news_context)
     except Exception as e:
         print(f"      ERROR generating tweet: {e}")
         if DB_AVAILABLE:
@@ -412,6 +443,30 @@ async def main(post: bool | None = None):
     print(tweet)
     print(f"{'='*60}")
     print(f"Length: {len(tweet)} chars | Position: {position}")
+
+    # ── 3.5. Quality filter ────────────────────────────────────────
+    print("\n[3.5/4] Quality filter...")
+    filter_score = 0.8
+    filter_passed = True
+    filter_reason = "filter_not_run"
+    try:
+        from agent.agents.filter import quality_check
+        filter_score, filter_passed, filter_reason = quality_check(tweet, market)
+        print(f"      Score: {filter_score:.2f} | Passed: {filter_passed} | {filter_reason}")
+    except Exception as e:
+        print(f"      Filter error: {e} — fail-open")
+
+    if not filter_passed:
+        print(f"      BLOCKED by quality filter — skipping post")
+        print(f"      Reason: {filter_reason}")
+        if DB_AVAILABLE:
+            db.record_run(
+                "skipped",
+                market_selected=market.get("question", ""),
+                error_message=f"quality_filter_blocked: {filter_reason}",
+            )
+        print(f"\nDone.")
+        return
 
     # ── 4. Post or dry run ─────────────────────────────────────────
     print("\n[4/4] Posting to OpenTweet...")
@@ -457,6 +512,8 @@ async def main(post: bool | None = None):
                 opentweet_post_id=post_id,
                 x_post_url=x_url,
                 arke_position=position,
+                quality_score=filter_score,
+                quality_passed=filter_passed,
             )
             duration_ms = int((time.time() - run_start) * 1000)
             db.record_run(

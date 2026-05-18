@@ -1,4 +1,5 @@
 import { headers } from "next/headers";
+import { LiveIndicator } from "./components/LiveIndicator";
 
 export const revalidate = 300;
 
@@ -81,7 +82,7 @@ function StatsBar({ count }: { count: number }) {
         <span className="text-terminal-muted">|</span>
         <span>
           <span className="text-amber tabular-nums">{count}</span>{" "}
-          <span className="text-neutral-400">markets surfaced</span>
+          <span className="text-neutral-400">actionable markets</span>
         </span>
         <span className="text-terminal-muted">|</span>
         <a
@@ -92,6 +93,8 @@ function StatsBar({ count }: { count: number }) {
         >
           @arke_ai
         </a>
+        <span className="text-terminal-muted">|</span>
+        <LiveIndicator />
       </div>
     </header>
   );
@@ -117,6 +120,14 @@ export default async function Page() {
             ))}
           </div>
         )}
+
+        <div className="mt-8 border border-border bg-panel p-4 rounded">
+          <div className="text-amber text-sm mb-2">// accuracy track record</div>
+          <div className="text-xs text-neutral-400">
+            Arke makes falsifiable probabilistic claims on every market.
+            Track record populates as markets resolve.
+          </div>
+        </div>
       </div>
     </main>
   );

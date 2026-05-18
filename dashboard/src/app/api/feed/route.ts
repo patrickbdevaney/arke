@@ -13,6 +13,16 @@ const SPORTS_KEYWORDS = [
   "Mets", "Cubs", "Padres", "Giants", "NBA", "NFL", "MLB", "NHL",
   "UFC", "Formula 1", "F1 ", "Grand Prix", "Champions League",
   "Premier League", "La Liga", "Bundesliga", "Serie A",
+  // French football
+  "Toulouse", "Marseille", "Lyon", "Monaco", "Lens", "Rennes",
+  "Nantes", "Strasbourg", "Montpellier", "Brest", "Ligue 1",
+  // More sports
+  "Eredivisie", "MLS", "ATP", "WTA",
+  "Roland Garros", "US Open", "Australian Open", "Tour de France",
+  "Superbowl", "Super Bowl", "March Madness", "World Series",
+  "Stanley Cup", "NBA Finals", "cricket", "rugby",
+  // Esports
+  "CSGO", "Dota 2", "Overwatch", "StarCraft", "PUBG",
 ];
 
 function isSports(q: string): boolean {
@@ -33,6 +43,9 @@ type GammaMarket = {
 
 export async function GET() {
   const builderAddr = process.env.POLY_BUILDER_ADDRESS ?? "";
+  if (!builderAddr) {
+    console.warn("[Feed] POLY_BUILDER_ADDRESS not set — bet URLs missing attribution");
+  }
 
   let markets: GammaMarket[] = [];
   try {
@@ -56,7 +69,16 @@ export async function GET() {
       const q = m.question ?? "";
       return { m, vol, pct, q };
     })
-    .filter(({ vol, pct, q }) => vol > 50_000 && pct >= 20 && pct <= 80 && !isSports(q))
+    .filter(({ m, vol, pct, q }) => {
+      if (vol <= 50_000 || pct < 20 || pct > 80 || isSports(q)) return false;
+      // Filter out markets ending in the past
+      if (m.endDateIso) {
+        const endDate = new Date(m.endDateIso);
+        const now = new Date();
+        if (endDate < now) return false;
+      }
+      return true;
+    })
     .sort((a, b) => b.vol - a.vol)
     .map(({ m, vol, pct, q }) => {
       const eventSlug = m.events?.[0]?.slug ?? m.slug ?? "";
