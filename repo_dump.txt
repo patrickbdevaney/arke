@@ -1,0 +1,3421 @@
+================================================================================
+REPO DUMP — arke
+Generated: 2026-05-18T01:55:14.884148
+Root: /home/patrickd/arke
+Files: 35
+================================================================================
+
+DIRECTORY TREE
+================================================================================
+arke/
+├── agent
+│   ├── agents
+│   │   ├── __init__.py
+│   │   ├── filter.py
+│   │   ├── generator.py
+│   │   └── resolver.py
+│   ├── integrations
+│   │   ├── __init__.py
+│   │   ├── circle.py
+│   │   ├── cryptopanic.py
+│   │   ├── gdelt.py
+│   │   ├── opentweet.py
+│   │   ├── polymarket.py
+│   │   ├── signals.py
+│   │   └── snapshot.py
+│   ├── __init__.py
+│   ├── db.py
+│   └── scheduler.py
+├── contracts
+│   └── PredictionMarketLog.sol
+├── dashboard
+│   ├── src
+│   │   └── app
+│   │       ├── api
+│   │       │   └── feed
+│   │       │       └── route.ts
+│   │       ├── globals.css
+│   │       ├── layout.tsx
+│   │       └── page.tsx
+│   ├── next-env.d.ts
+│   ├── next.config.js
+│   ├── package.json
+│   ├── postcss.config.js
+│   ├── tailwind.config.js
+│   └── tsconfig.json
+├── infra
+│   ├── .github
+│   │   └── workflows
+│   │       └── deploy.yml
+│   ├── arke.service
+│   ├── install-service.sh
+│   └── server-setup.sh
+├── .env.example
+├── .gitignore
+├── dump_repo.py
+├── prove_the_loop.py
+└── requirements.txt
+
+FILE CONTENTS
+================================================================================
+
+================================================================================
+FILE: .env.example
+================================================================================
+# ───────────────────────────────────────────────────────────────────
+# Arke — environment template
+# Copy to .env and fill values. NEVER commit .env.
+# ───────────────────────────────────────────────────────────────────
+
+# ── LLM providers ──────────────────────────────────────────────────
+# Groq is the primary tweet generator (gpt-oss-120b).
+# Get key: https://console.groq.com/keys
+GROQ_API_KEY=
+GROQ_MODEL=openai/gpt-oss-120b
+
+# Cerebras runs the adversarial quality filter (qwen-3-235b).
+# Different model family from Groq = genuine disagreement possible.
+# Get key: https://cloud.cerebras.ai
+CEREBRAS_API_KEY=
+CEREBRAS_MODEL=qwen-3-235b-a22b-instruct-2507
+
+# ── Distribution ───────────────────────────────────────────────────
+# OpenTweet posts to @arke_ai on X.
+# Get key: https://opentweet.io
+OPENTWEET_API_KEY=
+
+# Public dashboard URL (used in tweet attribution).
+DASHBOARD_URL=arke.live
+
+# ── Polymarket builder attribution ─────────────────────────────────
+# Builder code is the keccak-encoded address pinned by Polymarket.
+# Address is the base wallet used to receive builder fees.
+# Apply: https://polymarket.com/builders
+POLY_BUILDER_CODE=
+POLY_BUILDER_ADDRESS=
+
+# Polymarket trading credentials (optional — only needed if posting orders,
+# not required for read-only feed + tweet workflow).
+POLY_BUILDER_API_KEY=
+POLY_BUILDER_SECRET=
+POLY_BUILDER_PASSPHRASE=
+
+# ── Signal sources ─────────────────────────────────────────────────
+# CryptoPanic free tier: https://cryptopanic.com/developers/api/
+CRYPTOPANIC_API_KEY=
+
+# GDELT requires no key.
+# Snapshot GraphQL requires no key.
+
+# ── Circle Developer Platform (hackathon rubric) ──────────────────
+# https://developers.circle.com
+CIRCLE_API_KEY=
+CIRCLE_ENTITY_SECRET=
+CIRCLE_WALLET_ID=
+
+================================================================================
+FILE: .gitignore
+================================================================================
+.env
+*.pyc
+__pycache__/
+arke.db
+arke.db-wal
+arke.db-shm
+venv/
+arke_env/
+node_modules/
+.next/
+dist/
+.DS_Store
+*.log
+
+================================================================================
+FILE: agent/__init__.py
+================================================================================
+
+
+================================================================================
+FILE: agent/agents/__init__.py
+================================================================================
+
+
+================================================================================
+FILE: agent/agents/filter.py
+================================================================================
+"""
+agent/agents/filter.py — Adversarial quality filter via Cerebras
+
+Uses qwen-3-235b-a22b-instruct-2507 on Cerebras (235B MoE, different family from Groq).
+Different model family = genuine adversarial disagreement possible.
+
+Provides:
+  quality_check(tweet: str, market: dict) -> tuple[float, bool, str]
+    Returns: (score 0-1, passed bool, reason string)
+"""
+
+import os
+import re
+import json
+import logging
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "qwen-3-235b-a22b-instruct-2507")
+THRESHOLD = 0.65
+
+
+def _build_prompt(tweet: str, market: dict) -> str:
+    question = market.get("question", "")
+    price = float(market.get("lastTradePrice", 0.5) or 0.5)
+    pct = int(price * 100)
+    vol24 = float(market.get("volume24hr", 0) or 0)
+
+    return f"""You are a strict fact-checker for prediction market analysis tweets.
+
+Tweet to evaluate:
+{tweet}
+
+Market: {question} — {pct}% YES probability, ${vol24:,.0f} daily volume
+
+Score this tweet 0.0-1.0 on three dimensions:
+1. Factual accuracy of any specific claims made (0-1). Penalize invented statistics, wrong dates, fabricated events.
+2. Specificity of reasoning (0-1). Does it cite a named mechanism, historical pattern, or real data point?
+3. Analytical credibility (0-1). Would a sophisticated prediction market trader find this credible?
+
+IMPORTANT: If the tweet contains a specific numerical claim (e.g. "sold 0.4% of BTC", "12% of Bitcoin holdings"), that claim MUST be verifiable from public knowledge about the subject. If you cannot verify it, score factual accuracy as 0.2 or lower.
+
+Return ONLY valid JSON: {{"score": 0.0, "factual": 0.0, "specific": 0.0, "credible": 0.0, "reason": "one sentence explanation"}}"""
+
+
+def _extract_json(text: str) -> dict | None:
+    """Best-effort JSON extraction from LLM output."""
+    if not text:
+        return None
+    text = text.strip()
+    # Try direct parse first
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # Find first {...} block
+    m = re.search(r"\{[\s\S]*\}", text)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+
+def quality_check(tweet: str, market: dict) -> tuple[float, bool, str]:
+    """Score tweet quality via Cerebras. Fail-open on errors."""
+    api_key = os.getenv("CEREBRAS_API_KEY")
+    if not api_key:
+        logger.info("[Filter] CEREBRAS_API_KEY not set — fail-open")
+        return (0.8, True, "filter_skipped_no_key")
+
+    try:
+        from cerebras.cloud.sdk import Cerebras
+    except Exception as e:
+        logger.warning(f"[Filter] cerebras SDK import failed: {e} — fail-open")
+        return (0.75, True, "filter_sdk_missing")
+
+    prompt = _build_prompt(tweet, market)
+
+    try:
+        client = Cerebras(api_key=api_key)
+        resp = client.chat.completions.create(
+            model=CEREBRAS_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+        )
+        content = (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        logger.warning(f"[Filter] Cerebras call failed: {e} — fail-open")
+        return (0.75, True, "filter_error_fail_open")
+
+    parsed = _extract_json(content)
+    if not parsed:
+        logger.warning(f"[Filter] unparseable response: {content[:200]} — fail-open")
+        return (0.75, True, "filter_unparseable_fail_open")
+
+    factual = float(parsed.get("factual", 0.0) or 0.0)
+    specific = float(parsed.get("specific", 0.0) or 0.0)
+    credible = float(parsed.get("credible", 0.0) or 0.0)
+    reason = str(parsed.get("reason", ""))[:240]
+
+    score = factual * 0.5 + specific * 0.25 + credible * 0.25
+    passed = score >= THRESHOLD
+
+    logger.info(f"[Filter] Score: {score:.2f} | passed: {passed} | Reason: {reason}")
+    return (score, passed, reason)
+
+================================================================================
+FILE: agent/agents/generator.py
+================================================================================
+"""
+agent/agents/generator.py — Tweet generation via Groq LLM
+
+Uses openai/gpt-oss-120b (120B MoE, MMLU 90%) on Groq.
+Falls back to llama-3.3-70b-versatile if the primary returns empty output.
+
+Provides:
+  generate_tweet(market: dict, news_context: str = "") -> str
+"""
+
+import os
+import logging
+
+from dotenv import load_dotenv
+from groq import Groq
+
+from agent.integrations.polymarket import get_market_url, get_event_context
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+PRIMARY_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+FALLBACK_MODEL = "llama-3.3-70b-versatile"
+
+
+def _build_prompt(market: dict, news_context: str) -> str:
+    price = float(market.get("lastTradePrice", 0.5) or 0.5)
+    pct = int(price * 100)
+    question = market.get("question", "")
+    vol24 = float(market.get("volume24hr", 0) or 0)
+    end_date = market.get("endDateIso", "")
+    market_url = get_market_url(market)
+    context = get_event_context(market)
+
+    news_block = f"\nRelevant news context: {news_context[:400]}" if news_context else ""
+
+    return f"""You are Arke, an autonomous prediction market intelligence agent. You write sharp, analytical tweets that crypto-native traders respect and engage with.
+
+Market: {question}
+Current probability: {pct}% YES
+24hr volume: ${vol24:,.0f} USDC
+Resolves: {end_date}
+Context: {context}{news_block}
+
+TWEET STRUCTURE (follow exactly):
+Line 1: State the event and the market's implied probability as a fact. One sentence. End with a period.
+Line 2: Your take — agree or disagree — with exactly one specific, data-grounded reason. Start with "I think" or "I disagree —". End with a period.
+Line 3: "Bet: {market_url}"
+
+RULES:
+- Total length under 240 characters including the URL
+- The probability must appear as a specific percentage number
+- Your reason must be specific — cite a mechanism, a historical pattern, or a named data point. Never vague generalities
+- Slightly contrarian is better than agreeing with consensus
+- No hashtags, no exclamation marks, no emojis, no ellipses
+- No comma splices — each clause is its own sentence
+- Do not start with "Market says" — vary the opening
+- Return only the tweet text, nothing else
+
+GOOD EXAMPLES:
+"MicroStrategy holds $40B in Bitcoin with zero liquidation pressure. Market prices 55% chance they sell by May 31 — that contradicts every public commitment Saylor has made since 2020.
+Bet: polymarket.com/event/microstrategy-sell-any-bitcoin-in-2025"
+
+"Strait of Hormuz at 30% normal traffic by June. Iran has closed it twice before and reopened within weeks under economic pressure. The market is underpricing normalization.
+Bet: polymarket.com/event/strait-of-hormuz-traffic-2026"
+
+BAD EXAMPLES (never do these):
+"Market says 55% chance MicroStrategy sells Bitcoin by May 31, I disagree, Saylor's long term strategy is unchanged" — comma splice, vague reason
+"55% YES on MicroStrategy selling BTC! Interesting market! 🔥" — exclamations, emoji, no take"""
+
+
+def generate_tweet(market: dict, news_context: str = "") -> str:
+    """Generate an analytical tweet for `market`. Returns the stripped string."""
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        logger.error("[Generator] GROQ_API_KEY not set")
+        return ""
+
+    client = Groq(api_key=api_key)
+    prompt = _build_prompt(market, news_context)
+
+    try:
+        response = client.chat.completions.create(
+            model=PRIMARY_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+        )
+        content = (response.choices[0].message.content or "").strip()
+    except Exception as e:
+        logger.warning(f"[Generator] primary model failed: {e}")
+        content = ""
+
+    if content and len(content) >= 20:
+        logger.info(f"[Generator] Tweet generated: {len(content)} chars (primary)")
+        return content
+
+    # Fallback
+    logger.warning(f"[Generator] primary returned empty/short — falling back to {FALLBACK_MODEL}")
+    try:
+        response = client.chat.completions.create(
+            model=FALLBACK_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=180,
+        )
+        content = (response.choices[0].message.content or "").strip()
+    except Exception as e:
+        logger.error(f"[Generator] fallback model failed: {e}")
+        return ""
+
+    logger.info(f"[Generator] Tweet generated: {len(content)} chars (fallback)")
+    return content
+
+================================================================================
+FILE: agent/agents/resolver.py
+================================================================================
+"""
+agent/agents/resolver.py — Market resolution checker
+
+Runs daily. Finds all markets past their end_date that aren't marked resolved.
+Checks Gamma API for resolution status. Updates db with outcome and accuracy.
+
+Provides:
+  check_resolutions() -> dict   — counts of markets checked and resolved
+"""
+
+import json
+import logging
+
+import httpx
+
+from agent.db import ArkeDB
+
+logger = logging.getLogger(__name__)
+
+GAMMA_URL = "https://gamma-api.polymarket.com/markets"
+
+
+def _parse_outcome(market_data: dict) -> str | None:
+    """Return 'YES', 'NO', or None given a Gamma market response."""
+    if not market_data.get("closed"):
+        return None
+
+    prices = market_data.get("outcomePrices")
+    if isinstance(prices, str):
+        try:
+            prices = json.loads(prices)
+        except Exception:
+            prices = None
+    if not prices or len(prices) < 2:
+        return None
+
+    try:
+        yes = float(prices[0])
+        no = float(prices[1])
+    except (TypeError, ValueError):
+        return None
+
+    if yes >= 0.99 and no <= 0.01:
+        return "YES"
+    if no >= 0.99 and yes <= 0.01:
+        return "NO"
+    return None
+
+
+async def _fetch_market(client: httpx.AsyncClient, condition_id: str) -> dict | None:
+    try:
+        r = await client.get(GAMMA_URL, params={"condition_ids": condition_id})
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if isinstance(data, list) and data:
+            return data[0]
+        if isinstance(data, dict):
+            return data
+    except Exception as e:
+        logger.warning(f"[Resolver] fetch {condition_id[:12]} failed: {e}")
+    return None
+
+
+async def check_resolutions() -> dict:
+    """Find unresolved past-end-date markets, check Gamma, mark resolutions."""
+    db = ArkeDB()
+    unresolved = db.get_unresolved_past_enddate()
+    logger.info(f"[Resolver] {len(unresolved)} unresolved markets past end_date")
+
+    resolved_count = 0
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for row in unresolved:
+            cid = row.get("condition_id", "")
+            if not cid:
+                continue
+
+            market = await _fetch_market(client, cid)
+            if not market:
+                continue
+
+            outcome = _parse_outcome(market)
+            if outcome is None:
+                continue
+
+            # Determine was_correct based on Arke's position from db
+            posts = []
+            try:
+                with db._conn() as conn:
+                    posts = [
+                        dict(r)
+                        for r in conn.execute(
+                            """
+                            SELECT arke_position, probability_pct
+                            FROM posted_markets
+                            WHERE condition_id = ? AND resolved = 0
+                            """,
+                            (cid,),
+                        ).fetchall()
+                    ]
+            except Exception as e:
+                logger.warning(f"[Resolver] db read failed for {cid[:12]}: {e}")
+                continue
+
+            was_correct = False
+            for p in posts:
+                pos = (p.get("arke_position") or "NEUTRAL").upper()
+                pct = int(p.get("probability_pct") or 0)
+                if pos == "AGREE" and pct > 50 and outcome == "YES":
+                    was_correct = True
+                    break
+                if pos == "AGREE" and pct <= 50 and outcome == "NO":
+                    was_correct = True
+                    break
+                if pos == "DISAGREE" and pct > 50 and outcome == "NO":
+                    was_correct = True
+                    break
+                if pos == "DISAGREE" and pct <= 50 and outcome == "YES":
+                    was_correct = True
+                    break
+
+            db.mark_resolved(cid, outcome, was_correct)
+            resolved_count += 1
+            logger.info(
+                f"[Resolver] {cid[:12]} resolved {outcome} | correct={was_correct} "
+                f"| {row.get('question', '')[:60]}"
+            )
+
+    return {
+        "markets_checked": len(unresolved),
+        "markets_resolved": resolved_count,
+    }
+
+================================================================================
+FILE: agent/db.py
+================================================================================
+"""
+agent/db.py — Arke persistence layer
+
+Production-grade SQLite database for deduplication, audit trail,
+accuracy tracking, and operational diagnostics.
+
+Schema is append-only and migration-safe. New columns added with
+ALTER TABLE ... ADD COLUMN so existing data is never destroyed.
+
+Usage:
+    from agent.db import ArkeDB
+    db = ArkeDB()
+
+    if not db.already_posted(condition_id):
+        db.record_post(market, tweet, market_url, post_id)
+    else:
+        db.record_skip(market, "cooldown_48hr")
+"""
+
+import sqlite3
+import os
+import logging
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# Default to arke.db in the project root (one level above agent/)
+DB_PATH = Path(__file__).parent.parent / "arke.db"
+
+
+class ArkeDB:
+    def __init__(self, db_path: str = None):
+        self.db_path = str(db_path or DB_PATH)
+        self._init()
+
+    # ------------------------------------------------------------------ #
+    # Internal                                                             #
+    # ------------------------------------------------------------------ #
+
+    def _conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")  # concurrent reads
+        conn.execute("PRAGMA synchronous=NORMAL")  # safe + fast
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        return conn
+
+    def _init(self):
+        """Create all tables and indexes. Idempotent — safe to call every startup."""
+        with self._conn() as conn:
+            conn.executescript("""
+                -- --------------------------------------------------------
+                -- Core: every market Arke has posted about
+                -- --------------------------------------------------------
+                CREATE TABLE IF NOT EXISTS posted_markets (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                    -- Market identity
+                    condition_id        TEXT NOT NULL,
+                    question            TEXT NOT NULL,
+                    slug                TEXT NOT NULL DEFAULT '',
+                    event_slug          TEXT NOT NULL DEFAULT '',
+                    market_url          TEXT NOT NULL DEFAULT '',
+
+                    -- Market state at time of posting
+                    probability_pct     INTEGER NOT NULL DEFAULT 0,
+                    volume_24hr         REAL    NOT NULL DEFAULT 0,
+                    volume_total        REAL    NOT NULL DEFAULT 0,
+                    liquidity           REAL    NOT NULL DEFAULT 0,
+                    end_date            TEXT    NOT NULL DEFAULT '',
+                    spread              REAL    NOT NULL DEFAULT 0,
+
+                    -- Tweet content
+                    tweet_text          TEXT    NOT NULL DEFAULT '',
+                    tweet_take          TEXT    NOT NULL DEFAULT '',   -- text without Bet: line
+                    tweet_length        INTEGER NOT NULL DEFAULT 0,
+
+                    -- Distribution
+                    opentweet_post_id   TEXT,
+                    x_post_url          TEXT,
+                    builder_code        TEXT    NOT NULL DEFAULT '',   -- which builder code was active
+
+                    -- Timing
+                    posted_at           TEXT    NOT NULL,
+                    posted_at_ts        INTEGER NOT NULL DEFAULT 0,    -- unix timestamp for fast range queries
+
+                    -- Resolution tracking (filled in later)
+                    resolved            INTEGER NOT NULL DEFAULT 0,    -- 0=open, 1=resolved
+                    resolution          TEXT,                          -- 'YES' or 'NO'
+                    resolution_date     TEXT,
+                    was_correct         INTEGER,                       -- 1=correct, 0=wrong, NULL=unresolved
+                    arke_position       TEXT,                          -- 'AGREE' or 'DISAGREE' with market
+
+                    -- Quality
+                    quality_score       REAL,                          -- Cerebras adversarial score 0-1
+                    quality_passed      INTEGER NOT NULL DEFAULT 1,    -- 1=passed filter, 0=blocked
+
+                    -- Engagement (updated async)
+                    x_likes             INTEGER,
+                    x_retweets          INTEGER,
+                    x_replies           INTEGER,
+                    x_impressions       INTEGER,
+                    engagement_updated  TEXT
+                );
+
+                -- --------------------------------------------------------
+                -- Deduplication cooldown index (most-queried path)
+                -- --------------------------------------------------------
+                CREATE INDEX IF NOT EXISTS idx_posted_condition_at
+                    ON posted_markets(condition_id, posted_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_posted_at_ts
+                    ON posted_markets(posted_at_ts DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_posted_resolved
+                    ON posted_markets(resolved, end_date);
+
+                -- --------------------------------------------------------
+                -- Skipped markets: why the agent didn't post
+                -- --------------------------------------------------------
+                CREATE TABLE IF NOT EXISTS skipped_markets (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    condition_id        TEXT    NOT NULL DEFAULT '',
+                    question            TEXT    NOT NULL DEFAULT '',
+                    probability_pct     INTEGER NOT NULL DEFAULT 0,
+                    volume_24hr         REAL    NOT NULL DEFAULT 0,
+                    reason              TEXT    NOT NULL,
+                    skipped_at          TEXT    NOT NULL,
+                    skipped_at_ts       INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_skipped_condition
+                    ON skipped_markets(condition_id, skipped_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_skipped_reason
+                    ON skipped_markets(reason);
+
+                -- --------------------------------------------------------
+                -- Feed snapshots: what the market feed looked like each run
+                -- --------------------------------------------------------
+                CREATE TABLE IF NOT EXISTS feed_snapshots (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    snapped_at          TEXT    NOT NULL,
+                    snapped_at_ts       INTEGER NOT NULL DEFAULT 0,
+                    market_count        INTEGER NOT NULL DEFAULT 0,
+                    actionable_count    INTEGER NOT NULL DEFAULT 0,
+                    top_question        TEXT    NOT NULL DEFAULT '',
+                    top_volume_24hr     REAL    NOT NULL DEFAULT 0,
+                    top_probability_pct INTEGER NOT NULL DEFAULT 0,
+                    markets_json        TEXT    NOT NULL DEFAULT '[]'  -- full feed as JSON for replay
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_snapshots_at
+                    ON feed_snapshots(snapped_at_ts DESC);
+
+                -- --------------------------------------------------------
+                -- Builder codes: audit trail of which code was used when
+                -- --------------------------------------------------------
+                CREATE TABLE IF NOT EXISTS builder_codes (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    builder_code        TEXT    NOT NULL UNIQUE,
+                    builder_address     TEXT    NOT NULL DEFAULT '',
+                    activated_at        TEXT    NOT NULL,
+                    deactivated_at      TEXT,
+                    reason              TEXT    NOT NULL DEFAULT '',   -- 'initial', 'rotated', 'compromised'
+                    is_active           INTEGER NOT NULL DEFAULT 1
+                );
+
+                -- --------------------------------------------------------
+                -- Operational log: every agent run
+                -- --------------------------------------------------------
+                CREATE TABLE IF NOT EXISTS agent_runs (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_at              TEXT    NOT NULL,
+                    run_at_ts           INTEGER NOT NULL DEFAULT 0,
+                    outcome             TEXT    NOT NULL DEFAULT '',   -- 'posted', 'skipped', 'error', 'dry_run'
+                    market_selected     TEXT,
+                    error_message       TEXT,
+                    duration_ms         INTEGER NOT NULL DEFAULT 0,
+                    groq_model          TEXT    NOT NULL DEFAULT '',
+                    builder_code        TEXT    NOT NULL DEFAULT ''
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_runs_at
+                    ON agent_runs(run_at_ts DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_runs_outcome
+                    ON agent_runs(outcome);
+            """)
+
+            # Migration-safe: add new columns to existing deployments
+            self._safe_add_columns(conn)
+
+    def _safe_add_columns(self, conn: sqlite3.Connection):
+        """Add any columns that don't exist yet. Safe to run on old databases."""
+        migrations = [
+            ("posted_markets", "tweet_take", "TEXT NOT NULL DEFAULT ''"),
+            ("posted_markets", "tweet_length", "INTEGER NOT NULL DEFAULT 0"),
+            ("posted_markets", "builder_code", "TEXT NOT NULL DEFAULT ''"),
+            ("posted_markets", "posted_at_ts", "INTEGER NOT NULL DEFAULT 0"),
+            ("posted_markets", "volume_total", "REAL NOT NULL DEFAULT 0"),
+            ("posted_markets", "liquidity", "REAL NOT NULL DEFAULT 0"),
+            ("posted_markets", "spread", "REAL NOT NULL DEFAULT 0"),
+            ("posted_markets", "arke_position", "TEXT"),
+            ("posted_markets", "quality_score", "REAL"),
+            ("posted_markets", "quality_passed", "INTEGER NOT NULL DEFAULT 1"),
+            ("posted_markets", "x_likes", "INTEGER"),
+            ("posted_markets", "x_retweets", "INTEGER"),
+            ("posted_markets", "x_replies", "INTEGER"),
+            ("posted_markets", "x_impressions", "INTEGER"),
+            ("posted_markets", "engagement_updated", "TEXT"),
+            ("skipped_markets", "skipped_at_ts", "INTEGER NOT NULL DEFAULT 0"),
+            ("skipped_markets", "probability_pct", "INTEGER NOT NULL DEFAULT 0"),
+            ("skipped_markets", "volume_24hr", "REAL NOT NULL DEFAULT 0"),
+        ]
+        existing = {}
+        for table, col, typedef in migrations:
+            if table not in existing:
+                rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+                existing[table] = {r["name"] for r in rows}
+            if col not in existing[table]:
+                try:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typedef}")
+                    existing[table].add(col)
+                    logger.info(f"Migration: added {table}.{col}")
+                except Exception as e:
+                    logger.warning(f"Migration skipped {table}.{col}: {e}")
+
+    def _now_iso(self) -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _now_ts(self) -> int:
+        return int(datetime.now(timezone.utc).timestamp())
+
+    # ------------------------------------------------------------------ #
+    # Core deduplication                                                   #
+    # ------------------------------------------------------------------ #
+
+    def already_posted(self, condition_id: str, cooldown_hours: int = 48) -> bool:
+        """Return True if this market was posted within cooldown_hours.
+
+        48hr default prevents re-posting the same market while still
+        allowing it to resurface once it's cycled out and back in.
+        Set cooldown_hours=0 to always allow re-posting (testing only).
+        """
+        if cooldown_hours == 0:
+            return False
+
+        cutoff_ts = self._now_ts() - (cooldown_hours * 3600)
+
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT posted_at_ts FROM posted_markets
+                WHERE condition_id = ?
+                AND posted_at_ts > ?
+                ORDER BY posted_at_ts DESC
+                LIMIT 1
+                """,
+                (condition_id, cutoff_ts),
+            ).fetchone()
+
+        return row is not None
+
+    def hours_since_posted(self, condition_id: str) -> float | None:
+        """Return hours since this market was last posted, or None if never."""
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT posted_at_ts FROM posted_markets
+                WHERE condition_id = ?
+                ORDER BY posted_at_ts DESC
+                LIMIT 1
+                """,
+                (condition_id,),
+            ).fetchone()
+
+        if not row:
+            return None
+
+        elapsed = self._now_ts() - row["posted_at_ts"]
+        return elapsed / 3600
+
+    # ------------------------------------------------------------------ #
+    # Writing                                                              #
+    # ------------------------------------------------------------------ #
+
+    def record_post(
+        self,
+        market: dict,
+        tweet_text: str,
+        market_url: str,
+        opentweet_post_id: str = None,
+        x_post_url: str = None,
+        quality_score: float = None,
+        quality_passed: bool = True,
+        arke_position: str = None,
+    ) -> int:
+        """Record a successfully posted market. Returns the row id."""
+        events = market.get("events", [])
+        event_slug = events[0].get("slug", "") if events else ""
+        builder_code = os.getenv("POLY_BUILDER_CODE", "")
+
+        # Parse take (without Bet: line) for storage
+        lines = tweet_text.strip().split("\n")
+        take_lines = [l for l in lines if not l.strip().startswith("Bet:")]
+        take = "\n".join(take_lines).strip()
+
+        now_iso = self._now_iso()
+        now_ts = self._now_ts()
+
+        with self._conn() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO posted_markets (
+                    condition_id, question, slug, event_slug, market_url,
+                    probability_pct, volume_24hr, volume_total, liquidity,
+                    end_date, spread, tweet_text, tweet_take, tweet_length,
+                    opentweet_post_id, x_post_url, builder_code,
+                    posted_at, posted_at_ts, quality_score, quality_passed,
+                    arke_position
+                ) VALUES (
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?,
+                    ?, ?, ?, ?,
+                    ?
+                )
+                """,
+                (
+                    market.get("conditionId", ""),
+                    market.get("question", ""),
+                    market.get("slug", ""),
+                    event_slug,
+                    market_url,
+                    int(float(market.get("lastTradePrice", 0)) * 100),
+                    float(market.get("volume24hr", 0)),
+                    float(market.get("volume", 0)),
+                    float(market.get("liquidity", 0)),
+                    market.get("endDateIso", ""),
+                    float(market.get("spread", 0)),
+                    tweet_text,
+                    take,
+                    len(tweet_text),
+                    opentweet_post_id,
+                    x_post_url,
+                    builder_code,
+                    now_iso,
+                    now_ts,
+                    quality_score,
+                    1 if quality_passed else 0,
+                    arke_position,
+                ),
+            )
+            return cursor.lastrowid
+
+    def record_skip(
+        self,
+        market: dict,
+        reason: str,
+    ):
+        """Record a market that passed the feed filter but was not posted."""
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO skipped_markets (
+                    condition_id, question, probability_pct,
+                    volume_24hr, reason, skipped_at, skipped_at_ts
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    market.get("conditionId", "unknown"),
+                    market.get("question", "unknown"),
+                    int(float(market.get("lastTradePrice", 0)) * 100),
+                    float(market.get("volume24hr", 0)),
+                    reason,
+                    self._now_iso(),
+                    self._now_ts(),
+                ),
+            )
+
+    def record_feed_snapshot(self, feed: list[dict], actionable: list[dict] = None):
+        """Log what the feed looked like each run."""
+        import json
+
+        top = feed[0] if feed else {}
+        actionable = actionable or feed
+
+        # Store minimal market data — enough to replay analysis
+        slim = [
+            {
+                "conditionId": m.get("conditionId", ""),
+                "question": m.get("question", ""),
+                "lastTradePrice": m.get("lastTradePrice", 0),
+                "volume24hr": m.get("volume24hr", 0),
+                "endDateIso": m.get("endDateIso", ""),
+            }
+            for m in feed[:20]  # cap at 20 to keep db size sane
+        ]
+
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO feed_snapshots (
+                    snapped_at, snapped_at_ts, market_count, actionable_count,
+                    top_question, top_volume_24hr, top_probability_pct, markets_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    self._now_iso(),
+                    self._now_ts(),
+                    len(feed),
+                    len(actionable),
+                    top.get("question", ""),
+                    float(top.get("volume24hr", 0)),
+                    int(float(top.get("lastTradePrice", 0)) * 100),
+                    json.dumps(slim),
+                ),
+            )
+
+    def record_run(
+        self,
+        outcome: str,
+        market_selected: str = None,
+        error_message: str = None,
+        duration_ms: int = 0,
+    ):
+        """Log every agent execution for operational monitoring."""
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO agent_runs (
+                    run_at, run_at_ts, outcome, market_selected,
+                    error_message, duration_ms, groq_model, builder_code
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    self._now_iso(),
+                    self._now_ts(),
+                    outcome,
+                    market_selected,
+                    error_message,
+                    duration_ms,
+                    os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
+                    os.getenv("POLY_BUILDER_CODE", ""),
+                ),
+            )
+
+    def register_builder_code(
+        self,
+        builder_code: str,
+        builder_address: str,
+        reason: str = "initial",
+    ):
+        """Register a builder code as active. Deactivates all previous codes."""
+        now = self._now_iso()
+        with self._conn() as conn:
+            # Deactivate all existing active codes
+            conn.execute(
+                """
+                UPDATE builder_codes
+                SET is_active = 0, deactivated_at = ?
+                WHERE is_active = 1
+                """,
+                (now,),
+            )
+            # Insert new active code (ignore if already exists)
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO builder_codes
+                    (builder_code, builder_address, activated_at, reason, is_active)
+                VALUES (?, ?, ?, ?, 1)
+                """,
+                (builder_code, builder_address, now, reason),
+            )
+
+    # ------------------------------------------------------------------ #
+    # Resolution tracking                                                  #
+    # ------------------------------------------------------------------ #
+
+    def mark_resolved(
+        self,
+        condition_id: str,
+        resolution: str,
+        was_correct: bool,
+        resolution_date: str = None,
+    ):
+        """Mark all posts for a market as resolved.
+
+        resolution: 'YES' or 'NO'
+        was_correct: True if Arke's position matched the resolution
+        """
+        with self._conn() as conn:
+            conn.execute(
+                """
+                UPDATE posted_markets
+                SET resolved = 1,
+                    resolution = ?,
+                    resolution_date = ?,
+                    was_correct = ?
+                WHERE condition_id = ?
+                AND resolved = 0
+                """,
+                (
+                    resolution,
+                    resolution_date or self._now_iso(),
+                    1 if was_correct else 0,
+                    condition_id,
+                ),
+            )
+
+    def get_unresolved_past_enddate(self) -> list[dict]:
+        """Markets past end date that haven't been marked resolved yet.
+        Used by the resolution checker to find markets to close out.
+        """
+        cutoff = datetime.now(timezone.utc).date().isoformat()
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT condition_id, question, end_date, slug, event_slug
+                FROM posted_markets
+                WHERE resolved = 0
+                AND end_date != ''
+                AND end_date < ?
+                ORDER BY end_date ASC
+                """,
+                (cutoff,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------ #
+    # Read queries                                                         #
+    # ------------------------------------------------------------------ #
+
+    def get_recent_posts(self, limit: int = 10) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM posted_markets
+                ORDER BY posted_at_ts DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_accuracy_stats(self) -> dict:
+        """Arke's accuracy track record. Core dashboard metric."""
+        with self._conn() as conn:
+            row = conn.execute("""
+                SELECT
+                    COUNT(*)                                        AS total_posted,
+                    SUM(CASE WHEN resolved = 1 THEN 1 ELSE 0 END)  AS total_resolved,
+                    SUM(CASE WHEN was_correct = 1 THEN 1 ELSE 0 END) AS total_correct,
+                    ROUND(
+                        100.0 * SUM(CASE WHEN was_correct = 1 THEN 1 ELSE 0 END)
+                        / NULLIF(SUM(CASE WHEN resolved = 1 THEN 1 ELSE 0 END), 0),
+                        1
+                    )                                               AS accuracy_pct,
+                    ROUND(AVG(volume_24hr), 0)                      AS avg_volume_24hr,
+                    ROUND(AVG(probability_pct), 0)                  AS avg_probability_pct
+                FROM posted_markets
+                """).fetchone()
+        return dict(row) if row else {}
+
+    def get_skip_reasons(self) -> list[dict]:
+        """Breakdown of why markets were skipped. Useful for tuning filters."""
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT reason, COUNT(*) as count
+                FROM skipped_markets
+                GROUP BY reason
+                ORDER BY count DESC
+                """).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_run_stats(self, days: int = 7) -> dict:
+        """Operational stats for the last N days."""
+        cutoff_ts = self._now_ts() - (days * 86400)
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_runs,
+                    SUM(CASE WHEN outcome = 'posted' THEN 1 ELSE 0 END)  AS posted,
+                    SUM(CASE WHEN outcome = 'skipped' THEN 1 ELSE 0 END) AS skipped,
+                    SUM(CASE WHEN outcome = 'error' THEN 1 ELSE 0 END)   AS errors,
+                    SUM(CASE WHEN outcome = 'dry_run' THEN 1 ELSE 0 END) AS dry_runs,
+                    ROUND(AVG(duration_ms), 0)                           AS avg_duration_ms
+                FROM agent_runs
+                WHERE run_at_ts > ?
+                """,
+                (cutoff_ts,),
+            ).fetchone()
+        return dict(row) if row else {}
+
+    def stats(self) -> dict:
+        """Quick summary for CLI output on startup."""
+        with self._conn() as conn:
+            posted = conn.execute("SELECT COUNT(*) FROM posted_markets").fetchone()[0]
+            skipped = conn.execute("SELECT COUNT(*) FROM skipped_markets").fetchone()[0]
+            runs = conn.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0]
+            last = conn.execute("""
+                SELECT posted_at, question, probability_pct, volume_24hr
+                FROM posted_markets
+                ORDER BY posted_at_ts DESC
+                LIMIT 1
+                """).fetchone()
+            accuracy = self.get_accuracy_stats()
+
+        return {
+            "total_posted": posted,
+            "total_skipped": skipped,
+            "total_runs": runs,
+            "accuracy_pct": accuracy.get("accuracy_pct"),
+            "total_resolved": accuracy.get("total_resolved", 0),
+            "last_post_at": last["posted_at"] if last else None,
+            "last_post_question": last["question"][:60] if last else None,
+            "last_post_pct": last["probability_pct"] if last else None,
+            "last_post_vol": last["volume_24hr"] if last else None,
+        }
+
+    def print_stats(self):
+        """Print a clean summary to stdout. Call on agent startup."""
+        s = self.stats()
+        print(f"\n{'─'*50}")
+        print(f"  Arke DB: {self.db_path}")
+        print(f"  Posts:    {s['total_posted']} total | {s['total_resolved']} resolved")
+        if s["accuracy_pct"] is not None:
+            print(f"  Accuracy: {s['accuracy_pct']}%")
+        print(f"  Skipped:  {s['total_skipped']} | Runs: {s['total_runs']}")
+        if s["last_post_at"]:
+            print(f"  Last:     {s['last_post_question']}")
+            print(f"            {s['last_post_pct']}% | ${s['last_post_vol']:,.0f}/24h")
+            print(f"            {s['last_post_at'][:19]} UTC")
+        print(f"{'─'*50}\n")
+
+================================================================================
+FILE: agent/integrations/__init__.py
+================================================================================
+
+
+================================================================================
+FILE: agent/integrations/circle.py
+================================================================================
+"""
+agent/integrations/circle.py — Circle Developer Platform integration
+
+Covers Circle primitives for hackathon rubric:
+  - Developer Wallet (agent treasury)
+  - Balance queries
+
+Requires: CIRCLE_API_KEY, CIRCLE_ENTITY_SECRET env vars.
+If not set, all functions return gracefully with logged warnings.
+
+Provides:
+  get_wallet_balance() -> dict           — USDC balance of agent wallet
+  log_market_to_circle(market) -> str    — logs a memo string locally
+"""
+
+import os
+import logging
+
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+CIRCLE_API_BASE = "https://api.circle.com/v1/w3s"
+
+
+async def get_wallet_balance() -> dict:
+    """USDC balance of the agent wallet. Graceful default if not configured."""
+    api_key = os.getenv("CIRCLE_API_KEY")
+    wallet_id = os.getenv("CIRCLE_WALLET_ID", "")
+
+    if not api_key or not wallet_id:
+        logger.warning("[Circle] not configured (CIRCLE_API_KEY/CIRCLE_WALLET_ID missing)")
+        return {"usdc_balance": "0", "error": "not_configured"}
+
+    url = f"{CIRCLE_API_BASE}/wallets/{wallet_id}/balances"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                url,
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            if r.status_code != 200:
+                logger.warning(f"[Circle] HTTP {r.status_code}")
+                return {"usdc_balance": "0", "error": f"http_{r.status_code}"}
+            data = r.json()
+            balances = ((data.get("data") or {}).get("tokenBalances") or [])
+            usdc = "0"
+            for b in balances:
+                tok = (b.get("token") or {}).get("symbol", "")
+                if tok.upper() == "USDC":
+                    usdc = b.get("amount", "0")
+                    break
+            return {"usdc_balance": usdc}
+    except Exception as e:
+        logger.warning(f"[Circle] balance fetch failed: {e}")
+        return {"usdc_balance": "0", "error": str(e)}
+
+
+def log_market_to_circle(market_data: dict) -> str:
+    """Log a market memo to Circle wallet (stub).
+
+    In the absence of an on-chain memo API for Circle Developer wallets,
+    this function logs a formatted line and returns a confirmation string.
+    Demonstrates Circle wallet awareness without requiring tx signing.
+    """
+    api_key = os.getenv("CIRCLE_API_KEY")
+    if not api_key:
+        logger.warning("[Circle] not configured — memo not sent")
+        return "circle_not_configured"
+
+    question = (market_data.get("question") or "")[:80]
+    cid = (market_data.get("conditionId") or "")[:16]
+    memo = f"ARKE/{cid}/{question}"
+    logger.info(f"[Circle] memo logged: {memo}")
+    return f"logged:{memo}"
+
+================================================================================
+FILE: agent/integrations/cryptopanic.py
+================================================================================
+"""
+agent/integrations/cryptopanic.py — CryptoPanic news signal source
+
+Free tier: https://cryptopanic.com/api/free/v1/posts/
+Requires CRYPTOPANIC_API_KEY env var.
+
+Provides:
+  fetch_signals() -> list[str]                  — trending keywords from hot news
+  fetch_news(limit=20) -> list[dict]            — raw news items
+  match_news_to_market(news, market) -> float   — relevance score 0-1
+"""
+
+import os
+import re
+import logging
+
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+API_URL = "https://cryptopanic.com/api/free/v1/posts/"
+
+STOPWORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "of", "in", "to", "for", "on", "at", "by", "with", "from", "as",
+    "and", "or", "but", "not", "no", "yes", "if", "then", "this", "that",
+    "these", "those", "it", "its", "he", "she", "we", "you", "they",
+    "his", "her", "their", "our", "your", "my", "me", "us", "him", "them",
+    "will", "would", "could", "should", "can", "may", "might", "must",
+    "have", "has", "had", "do", "does", "did", "done",
+    "than", "so", "such", "into", "out", "up", "down", "over", "under",
+    "more", "most", "less", "least", "all", "any", "some", "few", "many",
+    "after", "before", "during", "while", "when", "where", "what", "why",
+    "how", "who", "whom", "whose", "which",
+}
+
+
+def _extract_keywords(titles: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for title in titles:
+        for word in re.findall(r"[A-Za-z][A-Za-z0-9]{2,}", title or ""):
+            w = word.lower()
+            if w in STOPWORDS or len(w) < 3:
+                continue
+            if w in seen:
+                continue
+            seen.add(w)
+            out.append(w)
+    return out
+
+
+async def fetch_signals(filter: str = "hot", limit: int = 20) -> list[str]:
+    """Trending keywords from CryptoPanic hot news. Empty list on any failure."""
+    api_key = os.getenv("CRYPTOPANIC_API_KEY")
+    if not api_key:
+        logger.warning("[CryptoPanic] CRYPTOPANIC_API_KEY not set")
+        return []
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                API_URL,
+                params={
+                    "auth_token": api_key,
+                    "filter": filter,
+                    "kind": "news",
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
+            results = data.get("results", []) or []
+            titles = [it.get("title", "") for it in results[:limit]]
+            keywords = _extract_keywords(titles)
+            logger.info(f"[CryptoPanic] {len(keywords)} signals from {len(titles)} headlines")
+            return keywords
+    except Exception as e:
+        logger.warning(f"[CryptoPanic] fetch_signals failed: {e}")
+        return []
+
+
+async def fetch_news(limit: int = 20) -> list[dict]:
+    """Raw news items: title, url, published_at, votes.bullish/bearish, panic_score."""
+    api_key = os.getenv("CRYPTOPANIC_API_KEY")
+    if not api_key:
+        logger.warning("[CryptoPanic] CRYPTOPANIC_API_KEY not set")
+        return []
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                API_URL,
+                params={
+                    "auth_token": api_key,
+                    "filter": "hot",
+                    "kind": "news",
+                },
+            )
+            r.raise_for_status()
+            results = (r.json().get("results", []) or [])[:limit]
+
+        out = []
+        for it in results:
+            votes = it.get("votes", {}) or {}
+            out.append({
+                "title": it.get("title", ""),
+                "url": it.get("url", ""),
+                "published_at": it.get("published_at", ""),
+                "bullish": int(votes.get("positive", 0) or 0),
+                "bearish": int(votes.get("negative", 0) or 0),
+                "panic_score": int(votes.get("toxic", 0) or 0),
+            })
+        return out
+    except Exception as e:
+        logger.warning(f"[CryptoPanic] fetch_news failed: {e}")
+        return []
+
+
+def match_news_to_market(news_items: list[dict], market: dict) -> float:
+    """Fraction of market question words found in news titles. Score 0-1."""
+    question = (market.get("question", "") or "").lower()
+    q_words = {w for w in re.findall(r"[a-z][a-z0-9]{2,}", question) if w not in STOPWORDS}
+    if not q_words:
+        return 0.0
+
+    corpus = " ".join((n.get("title", "") or "").lower() for n in news_items)
+    if not corpus:
+        return 0.0
+
+    matched = sum(1 for w in q_words if w in corpus)
+    return matched / len(q_words)
+
+================================================================================
+FILE: agent/integrations/gdelt.py
+================================================================================
+"""
+agent/integrations/gdelt.py — GDELT global news signal source
+
+No API key required. Public REST API.
+Base URL: https://api.gdeltproject.org/api/v2/
+
+Provides:
+  fetch_trending_topics() -> list[str]         — trending global news keywords
+  fetch_geopolitical_events() -> list[dict]    — recent high-coverage events
+"""
+
+import re
+import logging
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
+SUMMARY_URL = "https://api.gdeltproject.org/api/v2/summary/summary"
+TV_URL = "https://api.gdeltproject.org/api/v2/tv/search"
+
+TIMEOUT = 5.0
+
+
+def _extract_keywords(titles: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for title in titles:
+        for word in re.findall(r"[A-Za-z][A-Za-z0-9]{3,}", title or ""):
+            w = word.lower()
+            if w in seen:
+                continue
+            seen.add(w)
+            out.append(w)
+    return out
+
+
+async def fetch_trending_topics() -> list[str]:
+    """Trending global keywords. Returns empty list on any failure (GDELT can be slow)."""
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            r = await client.get(
+                SUMMARY_URL,
+                params={"d": "web", "t": "summary"},
+            )
+            if r.status_code == 200:
+                titles = re.findall(r"<title[^>]*>([^<]+)</title>", r.text)
+                kws = _extract_keywords(titles)
+                if kws:
+                    logger.info(f"[GDELT] {len(kws)} trending topics (summary)")
+                    return kws
+    except Exception as e:
+        logger.warning(f"[GDELT] summary endpoint failed: {e}")
+
+    # Fallback: TV search timeline
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            r = await client.get(
+                TV_URL,
+                params={"query": "politics", "mode": "timelinevol", "format": "json"},
+            )
+            if r.status_code == 200:
+                data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+                titles = [str(v) for v in (data.values() if isinstance(data, dict) else [])]
+                kws = _extract_keywords(titles)
+                logger.info(f"[GDELT] {len(kws)} trending topics (tv fallback)")
+                return kws
+    except Exception as e:
+        logger.warning(f"[GDELT] tv fallback failed: {e}")
+
+    return []
+
+
+async def fetch_geopolitical_events(hours_back: int = 6) -> list[dict]:
+    """Recent geopolitical news articles. Empty list on any exception."""
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            r = await client.get(
+                DOC_URL,
+                params={
+                    "query": "geopolitics",
+                    "mode": "ArtList",
+                    "maxrecords": 10,
+                    "format": "json",
+                    "timespan": f"{hours_back}h",
+                },
+            )
+            if r.status_code != 200:
+                logger.warning(f"[GDELT] doc HTTP {r.status_code}")
+                return []
+            data = r.json() if r.headers.get("content-type", "").lower().startswith("application/json") else {}
+            articles = data.get("articles", []) or []
+            out = []
+            for a in articles[:10]:
+                out.append({
+                    "title": a.get("title", ""),
+                    "url": a.get("url", ""),
+                    "datetime": a.get("seendate", ""),
+                })
+            logger.info(f"[GDELT] {len(out)} geopolitical events fetched")
+            return out
+    except Exception as e:
+        logger.warning(f"[GDELT] fetch_geopolitical_events failed: {e}")
+        return []
+
+================================================================================
+FILE: agent/integrations/opentweet.py
+================================================================================
+"""
+agent/integrations/opentweet.py — OpenTweet API integration
+
+Provides:
+  post_tweet(tweet: str) -> dict   — posts to @arke_ai, returns response
+  remaining_credits() -> int       — checks remaining URL post credits
+"""
+
+import os
+import logging
+
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+POSTS_URL = "https://opentweet.io/api/v1/posts"
+ME_URL = "https://opentweet.io/api/v1/me"
+
+
+async def post_tweet(tweet: str) -> dict:
+    """POST tweet to OpenTweet. Returns response JSON on 2xx, else empty dict."""
+    api_key = os.getenv("OPENTWEET_API_KEY")
+    if not api_key:
+        logger.warning("[OpenTweet] OPENTWEET_API_KEY not set — skipping post")
+        return {}
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                POSTS_URL,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"text": tweet, "publish_now": True},
+            )
+            logger.info(f"[OpenTweet] HTTP {resp.status_code}")
+            if resp.status_code in (200, 201):
+                return resp.json()
+            logger.error(f"[OpenTweet] error body: {resp.text[:300]}")
+            return {}
+    except Exception as e:
+        logger.error(f"[OpenTweet] request failed: {e}")
+        return {}
+
+
+async def remaining_credits() -> int:
+    """GET /me; return limits.remaining_posts_today, or -1 on failure."""
+    api_key = os.getenv("OPENTWEET_API_KEY")
+    if not api_key:
+        logger.warning("[OpenTweet] OPENTWEET_API_KEY not set")
+        return -1
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                ME_URL,
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            if resp.status_code != 200:
+                logger.warning(f"[OpenTweet] /me HTTP {resp.status_code}")
+                return -1
+            data = resp.json()
+            limits = data.get("limits", {}) or {}
+            return int(limits.get("remaining_posts_today", -1))
+    except Exception as e:
+        logger.error(f"[OpenTweet] /me failed: {e}")
+        return -1
+
+================================================================================
+FILE: agent/integrations/polymarket.py
+================================================================================
+"""
+agent/integrations/polymarket.py — Polymarket Gamma API integration
+
+Provides:
+  fetch_arke_feed() -> list[dict]   — top non-sports markets with genuine uncertainty
+  pick_best_market(feed) -> dict    — urgency-weighted selection with dedup
+  get_market_url(market) -> str     — correct polymarket.com/event/{slug} URL with ?ref=
+  get_event_context(market) -> str  — Polymarket's own AI context for the market
+"""
+
+import os
+import datetime
+import logging
+
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+GAMMA_URL = "https://gamma-api.polymarket.com/markets"
+
+SPORTS_KEYWORDS = [
+    "vs.", "vs ", "O/U", "Spread:", "Map ", "BO3", "BO5", "BO7",
+    "Pistons", "Cavaliers", "Spurs", "Lakers", "Dodgers", "Red Sox",
+    "Braves", "Angels", "Sinner", "Medvedev", "Aston Villa", "Liverpool",
+    "Counter-Strike", "CS:GO", "CS2", "LoL", "League of Legends",
+    "Dota", "Valorant", "Eurovision", "FIFA World Cup", "FIFA",
+    "Natus Vincere", "Scheffler", "PGA", "Masters", "Wimbledon",
+    "Celtics", "Knicks", "Heat", "Warriors", "Nuggets", "Yankees",
+    "Mets", "Cubs", "Padres", "Giants", "NBA", "NFL", "MLB", "NHL",
+    "UFC", "Formula 1", "F1 ", "Grand Prix", "Champions League",
+    "Premier League", "La Liga", "Bundesliga", "Serie A",
+]
+
+
+def is_sports(q: str) -> bool:
+    """Case-insensitive sports keyword check."""
+    if not q:
+        return False
+    q_lower = q.lower()
+    return any(kw.lower() in q_lower for kw in SPORTS_KEYWORDS)
+
+
+def get_market_url(market: dict) -> str:
+    """Correct Polymarket URL via event slug, with builder ?ref= if configured."""
+    events = market.get("events", []) or []
+    slug = events[0].get("slug", "") if events else market.get("slug", "")
+    if not slug:
+        slug = market.get("slug", "")
+    base = f"polymarket.com/event/{slug}"
+    builder_addr = os.getenv("POLY_BUILDER_ADDRESS", "")
+    if builder_addr:
+        return f"{base}?ref={builder_addr}"
+    return base
+
+
+def get_event_context(market: dict) -> str:
+    """Extract Polymarket's own AI context_description, truncated to 400 chars."""
+    events = market.get("events", []) or []
+    if not events:
+        return ""
+    meta = events[0].get("eventMetadata", {}) or {}
+    return (meta.get("context_description", "") or "")[:400]
+
+
+async def fetch_arke_feed() -> list[dict]:
+    """Fetch top markets by 24hr volume; filter to actionable set."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(
+                GAMMA_URL,
+                params={
+                    "active": "true",
+                    "limit": 100,
+                    "order": "volume24hr",
+                    "ascending": "false",
+                },
+            )
+            r.raise_for_status()
+            markets = r.json()
+    except Exception as e:
+        logger.error(f"[Polymarket] fetch failed: {e}")
+        return []
+
+    feed = []
+    for m in markets:
+        try:
+            vol = float(m.get("volume24hr", 0) or 0)
+            price = float(m.get("lastTradePrice", 0) or 0)
+            pct = int(price * 100)
+            q = m.get("question", "") or ""
+        except (TypeError, ValueError):
+            continue
+
+        if vol > 50_000 and 20 <= pct <= 80 and not is_sports(q):
+            feed.append(m)
+
+    feed.sort(key=lambda m: float(m.get("volume24hr", 0) or 0), reverse=True)
+    logger.info(f"[Polymarket] {len(feed)} actionable markets fetched")
+    return feed
+
+
+def pick_best_market(feed: list[dict], db=None) -> dict | None:
+    """Prefer markets resolving in 0-30 days that aren't in cooldown.
+    Fallback to any not in cooldown. Final fallback: top market with warning.
+    """
+    if not feed:
+        return None
+
+    today = datetime.date.today()
+
+    def in_cooldown(m: dict) -> bool:
+        if db is None:
+            return False
+        try:
+            return db.already_posted(m.get("conditionId", ""), cooldown_hours=48)
+        except Exception:
+            return False
+
+    # First pass: urgent (≤30 days) and not in cooldown
+    for m in feed:
+        if in_cooldown(m):
+            continue
+        end_str = m.get("endDateIso", "") or ""
+        try:
+            end_date = datetime.date.fromisoformat(end_str.split("T")[0])
+            days_left = (end_date - today).days
+            if 0 <= days_left <= 30:
+                logger.info(
+                    f"[Polymarket] Selected (urgent, {days_left}d left): "
+                    f"{m.get('question', '')[:60]}"
+                )
+                return m
+        except Exception:
+            continue
+
+    # Second pass: anything not in cooldown
+    for m in feed:
+        if in_cooldown(m):
+            continue
+        logger.info(
+            f"[Polymarket] Selected (not in cooldown): {m.get('question', '')[:60]}"
+        )
+        return m
+
+    # Final fallback: ignore cooldown
+    logger.warning("[Polymarket] All markets in cooldown — using top market")
+    return feed[0]
+
+================================================================================
+FILE: agent/integrations/signals.py
+================================================================================
+"""
+agent/integrations/signals.py — unified news/headline signal source
+
+Pulls headlines from a small set of verified RSS feeds plus GDELT.
+Stdlib XML parsing (no feedparser dependency). Each source is fetched
+concurrently, fails open, and individual 403s are tolerated.
+
+Provides:
+  fetch_headlines() -> list[dict]   — flat list of {title, url, source}
+"""
+
+import asyncio
+import logging
+import xml.etree.ElementTree as ET
+
+import httpx
+
+log = logging.getLogger(__name__)
+
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+RSS_FEEDS = [
+    {
+        "name": "Cointelegraph",
+        "url": "https://cointelegraph.com/rss",
+        "timeout": 8.0,
+    },
+    {
+        "name": "Bitcoin.com",
+        "url": "https://news.bitcoin.com/feed",
+        "timeout": 8.0,
+    },
+    {
+        "name": "Crypto.news",
+        "url": "https://crypto.news/feed",
+        "timeout": 8.0,
+    },
+    {
+        "name": "CryptoPanic",
+        "url": "https://cryptopanic.com/news/rss/",
+        "timeout": 8.0,
+    },
+]
+
+GDELT_URL = (
+    "https://api.gdeltproject.org/api/v2/doc/doc"
+    "?query=bitcoin+federal+reserve+iran+geopolitics+prediction"
+    "&mode=ArtList&maxrecords=10&format=json"
+)
+
+
+def _parse_rss(xml_text: str, source_name: str) -> list[dict]:
+    """Parse RSS 2.0 or Atom XML into list of headline dicts."""
+    headlines = []
+    try:
+        root = ET.fromstring(xml_text)
+        ns = {"atom": "http://www.w3.org/2005/Atom"}
+
+        # RSS 2.0: items under channel
+        items = root.findall(".//item")
+        # Atom fallback: entries
+        if not items:
+            items = root.findall(".//atom:entry", ns)
+
+        for item in items[:15]:
+            # Title
+            title_el = item.find("title")
+            if title_el is None:
+                title_el = item.find("atom:title", ns)
+            title = ""
+            if title_el is not None:
+                title = (title_el.text or "").strip()
+                # Strip CDATA if present
+                title = title.replace("<![CDATA[", "").replace("]]>", "").strip()
+
+            # Link
+            link = ""
+            link_el = item.find("link")
+            if link_el is not None:
+                link = (link_el.text or link_el.get("href", "")).strip()
+            if not link:
+                atom_link = item.find("atom:link", ns)
+                if atom_link is not None:
+                    link = atom_link.get("href", "").strip()
+
+            if title and len(title) > 5:
+                headlines.append({
+                    "title": title,
+                    "url": link,
+                    "source": source_name,
+                })
+    except ET.ParseError as e:
+        log.debug(f"[Signals] RSS parse error for {source_name}: {e}")
+    except Exception as e:
+        log.debug(f"[Signals] Unexpected parse error for {source_name}: {e}")
+    return headlines
+
+
+async def _fetch_rss(feed: dict) -> list[dict]:
+    """Fetch and parse one RSS feed. Returns empty list on any failure."""
+    try:
+        async with httpx.AsyncClient(
+            timeout=feed["timeout"],
+            follow_redirects=True,
+        ) as client:
+            r = await client.get(
+                feed["url"],
+                headers={"User-Agent": USER_AGENT},
+            )
+            if r.status_code == 200:
+                headlines = _parse_rss(r.text, feed["name"])
+                log.debug(f"[Signals] {feed['name']}: {len(headlines)} headlines")
+                return headlines
+            log.debug(f"[Signals] {feed['name']} returned {r.status_code} — skipping")
+    except Exception as e:
+        log.debug(f"[Signals] {feed['name']} failed: {e}")
+    return []
+
+
+async def _fetch_gdelt() -> list[dict]:
+    """Fetch GDELT articles matching the Polymarket-relevant query."""
+    try:
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+            r = await client.get(GDELT_URL, headers={"User-Agent": USER_AGENT})
+            if r.status_code != 200:
+                log.debug(f"[Signals] GDELT returned {r.status_code} — skipping")
+                return []
+            try:
+                data = r.json()
+            except Exception:
+                return []
+            articles = data.get("articles", []) or []
+            out = []
+            for a in articles[:10]:
+                title = (a.get("title", "") or "").strip()
+                if title and len(title) > 5:
+                    out.append({
+                        "title": title,
+                        "url": a.get("url", ""),
+                        "source": "GDELT",
+                    })
+            log.debug(f"[Signals] GDELT: {len(out)} headlines")
+            return out
+    except Exception as e:
+        log.debug(f"[Signals] GDELT failed: {e}")
+        return []
+
+
+async def fetch_headlines() -> list[dict]:
+    """Concurrently fetch all signal sources; return flat headline list."""
+    tasks = [_fetch_rss(f) for f in RSS_FEEDS] + [_fetch_gdelt()]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    headlines: list[dict] = []
+    for res in results:
+        if isinstance(res, list):
+            headlines.extend(res)
+    log.info(
+        f"[Signals] {len(headlines)} headlines from "
+        f"{len({h['source'] for h in headlines})} sources"
+    )
+    return headlines
+
+================================================================================
+FILE: agent/integrations/snapshot.py
+================================================================================
+"""
+agent/integrations/snapshot.py — Snapshot DAO governance signal source
+
+GraphQL endpoint: https://hub.snapshot.org/graphql
+No authentication required.
+
+Provides:
+  fetch_active_proposals(limit=10) -> list[dict]   — live governance votes
+  proposal_to_signal(proposal) -> str              — human-readable signal string
+"""
+
+import logging
+from datetime import datetime, timezone
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+GRAPHQL_URL = "https://hub.snapshot.org/graphql"
+
+QUERY = """
+{
+  proposals(first: %d, where: {state: "active"}, orderBy: "created", orderDirection: desc) {
+    id title body state start end scores_total votes space { id name }
+  }
+}
+"""
+
+
+async def fetch_active_proposals(limit: int = 10) -> list[dict]:
+    """Active Snapshot governance proposals. Empty list on failure."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(
+                GRAPHQL_URL,
+                json={"query": QUERY % limit},
+                headers={"Content-Type": "application/json"},
+            )
+            if r.status_code != 200:
+                logger.warning(f"[Snapshot] HTTP {r.status_code}")
+                return []
+            data = r.json()
+            proposals = (data.get("data") or {}).get("proposals", []) or []
+            logger.info(f"[Snapshot] {len(proposals)} active proposals")
+            return proposals
+    except Exception as e:
+        logger.warning(f"[Snapshot] fetch_active_proposals failed: {e}")
+        return []
+
+
+def proposal_to_signal(proposal: dict) -> str:
+    """Format proposal as a one-line LLM context signal."""
+    space = (proposal.get("space") or {}).get("name", "?")
+    title = proposal.get("title", "(untitled)")
+    votes = proposal.get("votes", 0)
+    end_ts = proposal.get("end", 0)
+    try:
+        end_str = datetime.fromtimestamp(int(end_ts), tz=timezone.utc).strftime("%Y-%m-%d")
+    except Exception:
+        end_str = "?"
+    return f"{space}: {title} — {votes} votes, ends {end_str}"
+
+================================================================================
+FILE: agent/scheduler.py
+================================================================================
+"""
+agent/scheduler.py — Arke autonomous scheduler
+
+Runs the full pipeline every 6 hours.
+Runs the resolution checker every 24 hours.
+Survives all exceptions — logs and continues.
+
+Usage:
+  python agent/scheduler.py         # start autonomous agent
+  python agent/scheduler.py --once  # run once and exit (for testing)
+"""
+
+import asyncio
+import logging
+import os
+import sys
+import time
+from datetime import datetime
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Keep stdout (prints from prove_the_loop) line-buffered so it interleaves
+# with logger output in the right order when both are piped.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+# Make prove_the_loop importable from the project root regardless of how we're invoked.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_THIS_DIR)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-5s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("arke.scheduler")
+
+# Quiet down noisy third-party loggers
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+import schedule  # noqa: E402
+
+from prove_the_loop import main as loop_main  # noqa: E402
+from agent.agents.resolver import check_resolutions  # noqa: E402
+from agent.db import ArkeDB  # noqa: E402
+
+
+def _log_db_stats():
+    try:
+        db = ArkeDB()
+        s = db.stats()
+        last_q = (s.get("last_post_question") or "")[:50]
+        logger.info(
+            "DB: %d posts, %d resolved, last: %s",
+            s.get("total_posted", 0),
+            s.get("total_resolved", 0) or 0,
+            last_q or "(none)",
+        )
+    except Exception as e:
+        logger.warning("DB stats unavailable: %s", e)
+
+
+def run_loop():
+    """Wraps asyncio.run(loop_main(post=True)) in try/except. Logs duration."""
+    start = time.time()
+    logger.info("=== Arke Agent Starting ===")
+    _log_db_stats()
+    try:
+        asyncio.run(loop_main(post=True))
+        duration = time.time() - start
+        logger.info("=== Run complete in %.1fs — POSTED ===", duration)
+    except Exception as e:
+        duration = time.time() - start
+        logger.exception("Run failed after %.1fs: %s", duration, e)
+
+
+def run_resolver():
+    """Wraps asyncio.run(check_resolutions()) in try/except."""
+    start = time.time()
+    logger.info("=== Resolver Starting ===")
+    try:
+        result = asyncio.run(check_resolutions())
+        duration = time.time() - start
+        logger.info(
+            "=== Resolver complete in %.1fs: checked=%s resolved=%s ===",
+            duration,
+            result.get("markets_checked", 0),
+            result.get("markets_resolved", 0),
+        )
+    except Exception as e:
+        duration = time.time() - start
+        logger.exception("Resolver failed after %.1fs: %s", duration, e)
+
+
+def main():
+    schedule.every(6).hours.do(run_loop)
+    schedule.every(24).hours.do(run_resolver)
+
+    if "--once" in sys.argv:
+        logger.info("Running once and exiting (--once flag)")
+        run_loop()
+        return
+
+    next_run = schedule.next_run()
+    banner = (
+        "\n"
+        "╔══════════════════════════════════════════════════════════════╗\n"
+        "║   ARKE — Autonomous Prediction Market Intelligence Agent     ║\n"
+        "║   Loop:     every 6 hours                                    ║\n"
+        "║   Resolver: every 24 hours                                   ║\n"
+        f"║   Next run: {str(next_run)[:50]:<50}║\n"
+        "╚══════════════════════════════════════════════════════════════╝"
+    )
+    print(banner, flush=True)
+    logger.info("Scheduler started — next run at %s", next_run)
+
+    # Run once immediately on startup
+    run_loop()
+
+    while True:
+        try:
+            schedule.run_pending()
+        except Exception as e:
+            logger.exception("schedule.run_pending failed: %s", e)
+        time.sleep(60)
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+FILE: contracts/PredictionMarketLog.sol
+================================================================================
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+/**
+ * @title PredictionMarketLog
+ * @notice Arke's immutable audit trail on Arc testnet.
+ * @dev Every market the agent identifies is logged here with probability estimate and tweet URL.
+ *      This proves the agent has been operating continuously and transparently.
+ */
+contract PredictionMarketLog {
+    struct MarketEntry {
+        bytes32 conditionId;
+        string  question;
+        uint8   probabilityPct;
+        uint256 loggedAt;
+        string  tweetUrl;
+        bool    resolved;
+        bool    wasCorrect;
+    }
+
+    MarketEntry[] public entries;
+    address public immutable owner;
+    uint256 public totalCorrect;
+    uint256 public totalResolved;
+
+    event MarketLogged(
+        uint256 indexed entryId,
+        bytes32 indexed conditionId,
+        uint8   probabilityPct,
+        uint256 loggedAt
+    );
+
+    event MarketResolved(
+        uint256 indexed entryId,
+        bool    wasCorrect,
+        uint256 resolvedAt
+    );
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
+    }
+
+    constructor() {
+        owner = msg.sender;
+    }
+
+    function logMarket(
+        bytes32       conditionId,
+        string calldata question,
+        uint8         probabilityPct,
+        string calldata tweetUrl
+    ) external onlyOwner returns (uint256 entryId) {
+        require(probabilityPct <= 100, "Invalid probability");
+        entryId = entries.length;
+        entries.push(MarketEntry({
+            conditionId:    conditionId,
+            question:       question,
+            probabilityPct: probabilityPct,
+            loggedAt:       block.timestamp,
+            tweetUrl:       tweetUrl,
+            resolved:       false,
+            wasCorrect:     false
+        }));
+        emit MarketLogged(entryId, conditionId, probabilityPct, block.timestamp);
+    }
+
+    function resolveMarket(
+        uint256 entryId,
+        bool    wasCorrect
+    ) external onlyOwner {
+        require(entryId < entries.length, "Invalid entry");
+        require(!entries[entryId].resolved, "Already resolved");
+        entries[entryId].resolved   = true;
+        entries[entryId].wasCorrect = wasCorrect;
+        totalResolved++;
+        if (wasCorrect) totalCorrect++;
+        emit MarketResolved(entryId, wasCorrect, block.timestamp);
+    }
+
+    function totalEntries() external view returns (uint256) {
+        return entries.length;
+    }
+
+    function accuracyBps() external view returns (uint256) {
+        if (totalResolved == 0) return 0;
+        return (totalCorrect * 10000) / totalResolved;
+    }
+
+    function getEntry(uint256 entryId) external view returns (MarketEntry memory) {
+        require(entryId < entries.length, "Invalid entry");
+        return entries[entryId];
+    }
+}
+
+================================================================================
+FILE: dashboard/next-env.d.ts
+================================================================================
+/// <reference types="next" />
+/// <reference types="next/image-types/global" />
+
+// NOTE: This file should not be edited
+// see https://nextjs.org/docs/basic-features/typescript for more information.
+
+================================================================================
+FILE: dashboard/next.config.js
+================================================================================
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  reactStrictMode: true,
+  poweredByHeader: false,
+};
+
+module.exports = nextConfig;
+
+================================================================================
+FILE: dashboard/package.json
+================================================================================
+{
+  "name": "arke-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "next": "14.2.5",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "20.14.10",
+    "@types/react": "18.3.3",
+    "@types/react-dom": "18.3.0",
+    "autoprefixer": "10.4.19",
+    "postcss": "8.4.39",
+    "tailwindcss": "3.4.6",
+    "typescript": "5.5.3"
+  }
+}
+
+================================================================================
+FILE: dashboard/postcss.config.js
+================================================================================
+module.exports = {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+};
+
+================================================================================
+FILE: dashboard/src/app/api/feed/route.ts
+================================================================================
+import { NextResponse } from "next/server";
+
+export const revalidate = 300;
+
+const SPORTS_KEYWORDS = [
+  "vs.", "vs ", "O/U", "Spread:", "Map ", "BO3", "BO5", "BO7",
+  "Pistons", "Cavaliers", "Spurs", "Lakers", "Dodgers", "Red Sox",
+  "Braves", "Angels", "Sinner", "Medvedev", "Aston Villa", "Liverpool",
+  "Counter-Strike", "CS:GO", "CS2", "LoL", "League of Legends",
+  "Dota", "Valorant", "Eurovision", "FIFA World Cup", "FIFA",
+  "Natus Vincere", "Scheffler", "PGA", "Masters", "Wimbledon",
+  "Celtics", "Knicks", "Heat", "Warriors", "Nuggets", "Yankees",
+  "Mets", "Cubs", "Padres", "Giants", "NBA", "NFL", "MLB", "NHL",
+  "UFC", "Formula 1", "F1 ", "Grand Prix", "Champions League",
+  "Premier League", "La Liga", "Bundesliga", "Serie A",
+];
+
+function isSports(q: string): boolean {
+  if (!q) return false;
+  const ql = q.toLowerCase();
+  return SPORTS_KEYWORDS.some((kw) => ql.includes(kw.toLowerCase()));
+}
+
+type GammaMarket = {
+  conditionId?: string;
+  question?: string;
+  slug?: string;
+  lastTradePrice?: number | string;
+  volume24hr?: number | string;
+  endDateIso?: string;
+  events?: Array<{ slug?: string }>;
+};
+
+export async function GET() {
+  const builderAddr = process.env.POLY_BUILDER_ADDRESS ?? "";
+
+  let markets: GammaMarket[] = [];
+  try {
+    const r = await fetch(
+      "https://gamma-api.polymarket.com/markets?active=true&limit=100&order=volume24hr&ascending=false",
+      { next: { revalidate: 300 } }
+    );
+    if (!r.ok) {
+      return NextResponse.json([], { status: 200 });
+    }
+    markets = (await r.json()) as GammaMarket[];
+  } catch {
+    return NextResponse.json([], { status: 200 });
+  }
+
+  const cleaned = markets
+    .map((m) => {
+      const vol = Number(m.volume24hr ?? 0) || 0;
+      const price = Number(m.lastTradePrice ?? 0) || 0;
+      const pct = Math.round(price * 100);
+      const q = m.question ?? "";
+      return { m, vol, pct, q };
+    })
+    .filter(({ vol, pct, q }) => vol > 50_000 && pct >= 20 && pct <= 80 && !isSports(q))
+    .sort((a, b) => b.vol - a.vol)
+    .map(({ m, vol, pct, q }) => {
+      const eventSlug = m.events?.[0]?.slug ?? m.slug ?? "";
+      const ref = builderAddr ? `?ref=${builderAddr}` : "";
+      const betUrl = `polymarket.com/event/${eventSlug}${ref}`;
+      return {
+        conditionId: m.conditionId ?? "",
+        question: q,
+        probabilityPct: pct,
+        volume24hr: vol,
+        endDateIso: m.endDateIso ?? "",
+        betUrl,
+        eventSlug,
+      };
+    });
+
+  return NextResponse.json(cleaned);
+}
+
+================================================================================
+FILE: dashboard/src/app/globals.css
+================================================================================
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html, body {
+  background: #0a0a0a;
+  color: #e5e5e5;
+  font-family: "JetBrains Mono", "Fira Code", ui-monospace, monospace;
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+::selection {
+  background: #ffb347;
+  color: #0a0a0a;
+}
+
+================================================================================
+FILE: dashboard/src/app/layout.tsx
+================================================================================
+import type { Metadata } from "next";
+import "./globals.css";
+
+export const metadata: Metadata = {
+  title: "ARKE — autonomous prediction market intelligence",
+  description:
+    "Live Polymarket feed with Arke's analytical takes and accuracy track record.",
+};
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <html lang="en">
+      <body className="font-mono bg-bg text-neutral-200 min-h-screen">
+        {children}
+      </body>
+    </html>
+  );
+}
+
+================================================================================
+FILE: dashboard/src/app/page.tsx
+================================================================================
+import { headers } from "next/headers";
+
+export const revalidate = 300;
+
+type Market = {
+  conditionId: string;
+  question: string;
+  probabilityPct: number;
+  volume24hr: number;
+  endDateIso: string;
+  betUrl: string;
+  eventSlug: string;
+};
+
+async function getFeed(): Promise<Market[]> {
+  const h = headers();
+  const host = h.get("host") ?? "localhost:3000";
+  const proto =
+    h.get("x-forwarded-proto") ?? (host.startsWith("localhost") ? "http" : "https");
+  try {
+    const r = await fetch(`${proto}://${host}/api/feed`, {
+      next: { revalidate: 300 },
+    });
+    if (!r.ok) return [];
+    return (await r.json()) as Market[];
+  } catch {
+    return [];
+  }
+}
+
+function ProbabilityBar({ pct }: { pct: number }) {
+  const clamped = Math.max(0, Math.min(100, pct));
+  return (
+    <div className="w-full h-1.5 bg-neutral-800 rounded">
+      <div
+        className="h-1.5 bg-amber rounded transition-all"
+        style={{ width: `${clamped}%` }}
+      />
+    </div>
+  );
+}
+
+function MarketCard({ m }: { m: Market }) {
+  return (
+    <div className="border border-border bg-panel p-4 rounded hover:border-amber-dim transition-colors flex flex-col gap-3">
+      <div className="flex justify-between items-start gap-3">
+        <div className="text-sm text-neutral-200 leading-snug">{m.question}</div>
+        <div className="text-amber font-bold text-2xl tabular-nums shrink-0">
+          {m.probabilityPct}%
+        </div>
+      </div>
+      <ProbabilityBar pct={m.probabilityPct} />
+      <div className="flex justify-between text-xs">
+        <span className="text-terminal-green">
+          ${m.volume24hr.toLocaleString()} 24h
+        </span>
+        <span className="text-terminal-muted">
+          ends {m.endDateIso ? m.endDateIso.slice(0, 10) : "—"}
+        </span>
+      </div>
+      <a
+        href={`https://${m.betUrl}`}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="inline-block text-center bg-amber text-bg font-bold px-3 py-2 rounded text-sm hover:bg-amber-dim transition-colors"
+      >
+        Bet on Polymarket →
+      </a>
+    </div>
+  );
+}
+
+function StatsBar({ count }: { count: number }) {
+  return (
+    <header className="border-b border-border bg-panel sticky top-0 z-10">
+      <div className="max-w-6xl mx-auto px-4 py-3 flex flex-wrap items-center gap-x-6 gap-y-1 text-xs">
+        <span className="text-amber font-bold">ARKE</span>
+        <span className="text-neutral-400">
+          autonomous prediction market intelligence
+        </span>
+        <span className="text-terminal-muted">|</span>
+        <span>
+          <span className="text-amber tabular-nums">{count}</span>{" "}
+          <span className="text-neutral-400">markets surfaced</span>
+        </span>
+        <span className="text-terminal-muted">|</span>
+        <a
+          className="text-terminal-green hover:underline"
+          href="https://x.com/arke_ai"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          @arke_ai
+        </a>
+      </div>
+    </header>
+  );
+}
+
+export default async function Page() {
+  const feed = await getFeed();
+  return (
+    <main>
+      <StatsBar count={feed.length} />
+      <div className="max-w-6xl mx-auto px-4 py-6">
+        <h1 className="text-amber text-lg mb-4">
+          // live feed — top non-sports markets, 20-80% probability
+        </h1>
+        {feed.length === 0 ? (
+          <div className="text-terminal-muted text-sm">
+            No actionable markets right now. Feed refreshes every 5 minutes.
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {feed.map((m) => (
+              <MarketCard key={m.conditionId} m={m} />
+            ))}
+          </div>
+        )}
+      </div>
+    </main>
+  );
+}
+
+================================================================================
+FILE: dashboard/tailwind.config.js
+================================================================================
+/** @type {import('tailwindcss').Config} */
+module.exports = {
+  content: [
+    "./src/app/**/*.{js,ts,jsx,tsx}",
+    "./src/components/**/*.{js,ts,jsx,tsx}",
+  ],
+  theme: {
+    extend: {
+      colors: {
+        bg: "#0a0a0a",
+        panel: "#111111",
+        border: "#1f1f1f",
+        amber: {
+          DEFAULT: "#ffb347",
+          dim: "#b87a30",
+        },
+        terminal: {
+          green: "#22c55e",
+          red: "#ef4444",
+          muted: "#666666",
+        },
+      },
+      fontFamily: {
+        mono: ['"JetBrains Mono"', '"Fira Code"', "ui-monospace", "monospace"],
+      },
+    },
+  },
+  plugins: [],
+};
+
+================================================================================
+FILE: dashboard/tsconfig.json
+================================================================================
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "incremental": true,
+    "plugins": [{ "name": "next" }],
+    "paths": { "@/*": ["./src/*"] }
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+  "exclude": ["node_modules"]
+}
+
+================================================================================
+FILE: dump_repo.py
+================================================================================
+#!/usr/bin/env python3
+"""
+dump_repo.py — Dump full repo tree + file contents to a single text file
+
+Usage:
+    python dump_repo.py                    # dumps ~/arke/ to repo_dump.txt
+    python dump_repo.py /path/to/repo      # dumps specified path
+    python dump_repo.py /path/to/repo out.txt  # custom output file
+
+Output format:
+    - Directory tree at the top
+    - Each file's full path as a header
+    - File contents below it
+    - Clear delimiters between files
+"""
+
+import os
+import sys
+from pathlib import Path
+from datetime import datetime
+
+# ── Config ─────────────────────────────────────────────────────────────────
+
+SKIP_DIRS = {
+    ".git",
+    "__pycache__",
+    "node_modules",
+    ".next",
+    "venv",
+    "arke_env",
+    ".mypy_cache",
+    ".pytest_cache",
+    "dist",
+    "build",
+    ".turbo",
+    ".vercel",
+    "coverage",
+    ".nyc_output",
+}
+
+SKIP_FILES = {
+    ".DS_Store",
+    "Thumbs.db",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "arke.db",
+    "arke.db-wal",
+    "arke.db-shm",
+}
+
+SKIP_EXTENSIONS = {
+    ".pyc",
+    ".pyo",
+    ".so",
+    ".dylib",
+    ".dll",
+    ".class",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".ico",
+    ".svg",
+    ".webp",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".zip",
+    ".tar",
+    ".gz",
+    ".bz2",
+    ".bin",
+    ".exe",
+    ".pkl",
+    ".model",
+}
+
+MAX_FILE_BYTES = 200_000  # skip files larger than 200KB
+
+DELIMITER = "=" * 80
+
+
+# ── Tree builder ───────────────────────────────────────────────────────────
+
+
+def build_tree(root: Path, prefix: str = "") -> list[str]:
+    lines = []
+    try:
+        entries = sorted(root.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+    except PermissionError:
+        return lines
+
+    entries = [
+        e
+        for e in entries
+        if not (e.is_dir() and e.name in SKIP_DIRS)
+        and e.name not in SKIP_FILES
+        and not e.name.startswith(".")
+        or e.name in {".env.example", ".gitignore", ".github"}
+    ]
+
+    for i, entry in enumerate(entries):
+        is_last = i == len(entries) - 1
+        connector = "└── " if is_last else "├── "
+        lines.append(f"{prefix}{connector}{entry.name}")
+        if entry.is_dir():
+            extension = "    " if is_last else "│   "
+            lines.extend(build_tree(entry, prefix + extension))
+
+    return lines
+
+
+# ── File collector ─────────────────────────────────────────────────────────
+
+
+def collect_files(root: Path) -> list[Path]:
+    files = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        # Skip hidden except .env.example and .gitignore
+        if any(
+            part.startswith(".")
+            and part not in {".env.example", ".gitignore", ".github"}
+            for part in path.parts
+        ):
+            continue
+        # Skip dirs
+        if any(part in SKIP_DIRS for part in path.parts):
+            continue
+        # Skip files
+        if path.name in SKIP_FILES:
+            continue
+        # Skip extensions
+        if path.suffix.lower() in SKIP_EXTENSIONS:
+            continue
+        # Skip large files
+        if path.stat().st_size > MAX_FILE_BYTES:
+            continue
+        files.append(path)
+    return files
+
+
+# ── Main ───────────────────────────────────────────────────────────────────
+
+
+def main():
+    # Args
+    repo_root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.home() / "arke"
+    output_file = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("repo_dump.txt")
+
+    if not repo_root.exists():
+        print(f"ERROR: {repo_root} does not exist")
+        sys.exit(1)
+
+    repo_root = repo_root.resolve()
+    print(f"Dumping: {repo_root}")
+    print(f"Output:  {output_file}")
+
+    files = collect_files(repo_root)
+    tree_lines = build_tree(repo_root)
+
+    with open(output_file, "w", encoding="utf-8") as out:
+
+        # Header
+        out.write(DELIMITER + "\n")
+        out.write(f"REPO DUMP — {repo_root.name}\n")
+        out.write(f"Generated: {datetime.now().isoformat()}\n")
+        out.write(f"Root: {repo_root}\n")
+        out.write(f"Files: {len(files)}\n")
+        out.write(DELIMITER + "\n\n")
+
+        # Directory tree
+        out.write("DIRECTORY TREE\n")
+        out.write(DELIMITER + "\n")
+        out.write(f"{repo_root.name}/\n")
+        out.write("\n".join(tree_lines))
+        out.write("\n\n")
+
+        # File contents
+        out.write("FILE CONTENTS\n")
+        out.write(DELIMITER + "\n\n")
+
+        for path in files:
+            rel = path.relative_to(repo_root)
+
+            # File header
+            out.write(DELIMITER + "\n")
+            out.write(f"FILE: {rel}\n")
+            out.write(DELIMITER + "\n")
+
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+                out.write(content)
+                if not content.endswith("\n"):
+                    out.write("\n")
+            except Exception as e:
+                out.write(f"[ERROR reading file: {e}]\n")
+
+            out.write("\n")
+
+        # Footer
+        out.write(DELIMITER + "\n")
+        out.write(f"END OF DUMP — {len(files)} files\n")
+        out.write(DELIMITER + "\n")
+
+    size_kb = output_file.stat().st_size / 1024
+    print(f"Done. {len(files)} files → {output_file} ({size_kb:.1f} KB)")
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+FILE: infra/.github/workflows/deploy.yml
+================================================================================
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_IP }}
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            cd /opt/arke
+            git pull origin main
+            venv/bin/pip install -q -r requirements.txt
+            systemctl restart arke
+            systemctl status arke --no-pager
+            echo "Deploy complete: $(date)"
+
+================================================================================
+FILE: infra/arke.service
+================================================================================
+[Unit]
+Description=Arke Prediction Market Intelligence Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=arke
+WorkingDirectory=/opt/arke
+ExecStart=/opt/arke/venv/bin/python agent/scheduler.py
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+EnvironmentFile=/opt/arke/.env
+
+[Install]
+WantedBy=multi-user.target
+
+================================================================================
+FILE: infra/install-service.sh
+================================================================================
+#!/bin/bash
+# Installs the arke systemd service after .env is in place.
+# Usage: bash install-service.sh
+
+set -euo pipefail
+
+INSTALL_DIR="/opt/arke"
+
+cat > /etc/systemd/system/arke.service << EOF
+[Unit]
+Description=Arke Prediction Market Intelligence Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=arke
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$INSTALL_DIR/venv/bin/python agent/scheduler.py
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+EnvironmentFile=$INSTALL_DIR/.env
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable arke
+systemctl start arke
+systemctl status arke --no-pager
+echo "=== Arke agent started ==="
+echo "Monitor: journalctl -u arke -f"
+
+================================================================================
+FILE: infra/server-setup.sh
+================================================================================
+#!/bin/bash
+# Arke VPS bootstrap — Ubuntu 22.04
+# Run as root once after provisioning.
+# Usage: bash server-setup.sh
+
+set -euo pipefail
+
+echo "=== Arke VPS Bootstrap ==="
+
+# System deps
+apt-get update -qq
+apt-get install -y python3 python3-pip python3-venv git curl wget htop
+
+# Create arke user
+if ! id -u arke >/dev/null 2>&1; then
+    useradd -m -s /bin/bash arke
+    echo "Created arke user"
+fi
+
+# Clone repo (assumes GITHUB_REPO env var set, or edit inline)
+REPO_URL="${GITHUB_REPO:-https://github.com/your-handle/arke}"
+INSTALL_DIR="/opt/arke"
+
+if [ -d "$INSTALL_DIR" ]; then
+    cd "$INSTALL_DIR" && git pull
+else
+    git clone "$REPO_URL" "$INSTALL_DIR"
+fi
+
+chown -R arke:arke "$INSTALL_DIR"
+
+# Python venv
+sudo -u arke python3 -m venv "$INSTALL_DIR/venv"
+sudo -u arke "$INSTALL_DIR/venv/bin/pip" install -q --upgrade pip
+sudo -u arke "$INSTALL_DIR/venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt"
+
+echo "=== Copy your .env file ==="
+echo "Run: scp .env root@SERVER_IP:$INSTALL_DIR/.env"
+echo "Then run: bash $INSTALL_DIR/infra/install-service.sh"
+
+================================================================================
+FILE: prove_the_loop.py
+================================================================================
+"""
+prove_the_loop.py — Arke core proof
+
+Chain:
+1. Fetch live Arke feed from Polymarket Gamma API
+2. Pick best market — urgency + volume, non-sports, 20-80% probability
+3. Check SQLite deduplication — skip if posted within 48 hours
+4. Call Groq gpt-oss-120b to generate analytical tweet
+5. Post to @arke_ai via OpenTweet API
+6. Record to SQLite with builder code attribution
+
+Run:
+  python prove_the_loop.py          # dry run — safe, no post, no db write
+  python prove_the_loop.py --post   # live post, burns one OpenTweet credit
+"""
+
+import httpx
+import asyncio
+import os
+import sys
+import time
+from groq import Groq
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ------------------------------------------------------------------ #
+# DB import — graceful fallback if agent/ not in path                 #
+# ------------------------------------------------------------------ #
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from agent.db import ArkeDB
+
+    db = ArkeDB()
+    DB_AVAILABLE = True
+except Exception as e:
+    print(f"[WARN] DB unavailable: {e} — running without persistence")
+    db = None
+    DB_AVAILABLE = False
+
+DRY_RUN = "--post" not in sys.argv
+
+SPORTS_KEYWORDS = [
+    "vs.",
+    "vs ",
+    "O/U",
+    "Spread:",
+    "Map ",
+    "BO3",
+    "BO5",
+    "Pistons",
+    "Cavaliers",
+    "Spurs",
+    "Lakers",
+    "Dodgers",
+    "Red Sox",
+    "Braves",
+    "Angels",
+    "Sinner",
+    "Medvedev",
+    "Aston Villa",
+    "Liverpool",
+    "Counter-Strike",
+    "LoL",
+    "Eurovision",
+    "FIFA World Cup",
+    "Natus Vincere",
+    "Scheffler",
+    "PGA",
+    "Masters",
+    "Wimbledon",
+    "Celtics",
+    "Knicks",
+    "Heat",
+    "Warriors",
+    "Nuggets",
+    "Yankees",
+    "Mets",
+    "Cubs",
+    "Padres",
+    "Giants",
+]
+
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "arke.live")
+BUILDER_CODE = os.getenv("POLY_BUILDER_CODE", "")
+BUILDER_ADDR = os.getenv("POLY_BUILDER_ADDRESS", "")
+
+
+# ------------------------------------------------------------------ #
+# Helpers                                                              #
+# ------------------------------------------------------------------ #
+
+
+def is_sports(q: str) -> bool:
+    return any(kw.lower() in q.lower() for kw in SPORTS_KEYWORDS)
+
+
+def get_market_url(market: dict) -> str:
+    """Correct Polymarket URL via event slug.
+    Appends ?ref= builder address for attribution tracking.
+    """
+    events = market.get("events", [])
+    slug = events[0].get("slug", "") if events else market.get("slug", "")
+    base = (
+        f"polymarket.com/event/{slug}"
+        if slug
+        else f"polymarket.com/event/{market.get('slug','')}"
+    )
+    ref = f"?ref={BUILDER_ADDR}" if BUILDER_ADDR else ""
+    return f"{base}{ref}"
+
+
+def infer_arke_position(tweet_text: str) -> str:
+    """Parse whether Arke agreed or disagreed with the market for accuracy tracking."""
+    lower = tweet_text.lower()
+    if "i disagree" in lower:
+        return "DISAGREE"
+    if "i think" in lower:
+        return "AGREE"
+    return "NEUTRAL"
+
+
+# ------------------------------------------------------------------ #
+# Feed                                                                 #
+# ------------------------------------------------------------------ #
+
+
+async def fetch_arke_feed() -> list[dict]:
+    """Fetch top 100 markets by 24hr volume, filter to actionable set."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get(
+            "https://gamma-api.polymarket.com/markets",
+            params={
+                "active": "true",
+                "limit": 100,
+                "order": "volume24hr",
+                "ascending": "false",
+            },
+        )
+        r.raise_for_status()
+        markets = r.json()
+
+    feed = []
+    for m in markets:
+        vol = float(m.get("volume24hr", 0))
+        price = float(m.get("lastTradePrice", 0))
+        pct = int(price * 100)
+        q = m.get("question", "")
+
+        if vol > 50_000 and 20 <= pct <= 80 and not is_sports(q):
+            feed.append(m)
+
+    feed.sort(key=lambda m: float(m.get("volume24hr", 0)), reverse=True)
+    return feed
+
+
+def pick_best_market(feed: list[dict]) -> dict | None:
+    """Prefer markets resolving within 30 days (urgency = engagement).
+    Skips markets already posted within the 48hr cooldown.
+    Falls back to highest volume if nothing resolves soon.
+    """
+    import datetime
+
+    today = datetime.date.today()
+
+    # First pass: urgent markets not in cooldown
+    for m in feed:
+        if DB_AVAILABLE and db.already_posted(
+            m.get("conditionId", ""), cooldown_hours=48
+        ):
+            continue
+        end_str = m.get("endDateIso", "")
+        try:
+            end_date = datetime.date.fromisoformat(end_str)
+            days_left = (end_date - today).days
+            if 0 <= days_left <= 30:
+                return m
+        except Exception:
+            continue
+
+    # Second pass: any market not in cooldown (long-dated)
+    for m in feed:
+        if DB_AVAILABLE and db.already_posted(
+            m.get("conditionId", ""), cooldown_hours=48
+        ):
+            continue
+        return m
+
+    # Final fallback: ignore cooldown (feed may be fully exhausted)
+    print("      [WARN] All markets in cooldown — falling back to top market")
+    return feed[0] if feed else None
+
+
+# ------------------------------------------------------------------ #
+# Tweet generation                                                     #
+# ------------------------------------------------------------------ #
+
+
+def generate_tweet(market: dict, groq_api_key: str) -> str:
+    """Generate analytical tweet via Groq gpt-oss-120b."""
+    client = Groq(api_key=groq_api_key)
+
+    price = float(market.get("lastTradePrice", 0.5))
+    pct = int(price * 100)
+    question = market["question"]
+    vol24 = float(market.get("volume24hr", 0))
+    end_date = market.get("endDateIso", "")
+    market_url = get_market_url(market)
+
+    context = ""
+    events = market.get("events", [])
+    if events:
+        meta = events[0].get("eventMetadata", {})
+        context = meta.get("context_description", "")[:400]
+
+    prompt = f"""You are Arke, an autonomous prediction market intelligence agent. You write sharp, analytical tweets that crypto-native traders respect and engage with.
+
+Market: {question}
+Current probability: {pct}% YES
+24hr volume: ${vol24:,.0f} USDC
+Resolves: {end_date}
+Context: {context}
+
+TWEET STRUCTURE (follow exactly):
+Line 1: State the event and the market's implied probability as a fact. One sentence. End with a period.
+Line 2: Your take — agree or disagree — with exactly one specific, data-grounded reason. Start with "I think" or "I disagree —". End with a period.
+Line 3: "Bet: {market_url}"
+
+RULES:
+- Total length under 240 characters including the URL
+- The probability must appear as a specific percentage number
+- Your reason must be specific — cite a mechanism, a historical pattern, or a named data point. Never vague generalities
+- Slightly contrarian is better than agreeing with consensus
+- No hashtags, no exclamation marks, no emojis, no ellipses
+- No comma splices — each clause is its own sentence
+- Do not start with "Market says" — vary the opening
+- Return only the tweet text, nothing else
+
+GOOD EXAMPLES:
+"MicroStrategy holds $40B in Bitcoin with zero liquidation pressure. Market prices 55% chance they sell by May 31 — that contradicts every public commitment Saylor has made since 2020.
+Bet: polymarket.com/event/microstrategy-sell-any-bitcoin-in-2025"
+
+"Strait of Hormuz at 30% normal traffic by June. Iran has closed it twice before and reopened within weeks under economic pressure. The market is underpricing normalization.
+Bet: polymarket.com/event/strait-of-hormuz-traffic-2026"
+
+BAD EXAMPLES (never do these):
+"Market says 55% chance MicroStrategy sells Bitcoin by May 31, I disagree, Saylor's long term strategy is unchanged" — comma splice, vague reason
+"55% YES on MicroStrategy selling BTC! Interesting market! 🔥" — exclamations, emoji, no take"""
+
+    response = client.chat.completions.create(
+        model="openai/gpt-oss-120b",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.7,
+    )
+
+    return response.choices[0].message.content.strip()
+
+
+# ------------------------------------------------------------------ #
+# Posting                                                              #
+# ------------------------------------------------------------------ #
+
+
+async def post_to_opentweet(tweet: str) -> dict:
+    """Post via OpenTweet API. Returns response dict or empty on failure."""
+    api_key = os.getenv("OPENTWEET_API_KEY")
+    if not api_key:
+        print("      OPENTWEET_API_KEY not set — skipping post")
+        return {}
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(
+            "https://opentweet.io/api/v1/posts",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "text": tweet,
+                "publish_now": True,
+            },
+        )
+        print(f"      HTTP {resp.status_code}")
+        print(f"      Response: {resp.text[:300]}")
+        if resp.status_code in (200, 201):
+            return resp.json()
+        return {}
+
+
+# ------------------------------------------------------------------ #
+# Main                                                                 #
+# ------------------------------------------------------------------ #
+
+
+async def main(post: bool | None = None):
+    """Run the full loop once.
+
+    post=None (default): use --post / DRY_RUN detection from sys.argv
+    post=True: force live post
+    post=False: force dry run
+    """
+    dry_run = (not post) if post is not None else DRY_RUN
+
+    run_start = time.time()
+
+    # ── Env check ──────────────────────────────────────────────────
+    print("DEBUG: loading env vars...")
+    groq_key = os.getenv("GROQ_API_KEY")
+    opentweet_key = os.getenv("OPENTWEET_API_KEY")
+
+    print(f"DEBUG: GROQ_API_KEY      = {groq_key[:10] if groq_key else 'NOT SET'}")
+    print(
+        f"DEBUG: OPENTWEET_API_KEY = {opentweet_key[:10] if opentweet_key else 'NOT SET'}"
+    )
+    print(
+        f"DEBUG: BUILDER_CODE      = {BUILDER_CODE[:16] if BUILDER_CODE else 'NOT SET'}"
+    )
+    print(
+        f"DEBUG: BUILDER_ADDRESS   = {BUILDER_ADDR[:16] if BUILDER_ADDR else 'NOT SET'}"
+    )
+    print(f"DEBUG: DB_AVAILABLE      = {DB_AVAILABLE}")
+    print(f"DEBUG: DRY_RUN           = {dry_run}")
+    print()
+
+    if not groq_key:
+        print("ERROR: GROQ_API_KEY not set — add to ~/arke/.env")
+        if DB_AVAILABLE:
+            db.record_run("error", error_message="GROQ_API_KEY not set")
+        return
+
+    # ── DB startup stats ───────────────────────────────────────────
+    if DB_AVAILABLE:
+        db.print_stats()
+
+    # ── 1. Fetch feed ──────────────────────────────────────────────
+    print("[1/4] Fetching Arke feed...")
+    try:
+        feed = await fetch_arke_feed()
+    except Exception as e:
+        print(f"      ERROR fetching feed: {e}")
+        if DB_AVAILABLE:
+            db.record_run("error", error_message=f"feed fetch failed: {e}")
+        return
+
+    print(f"      Found {len(feed)} actionable markets")
+    for m in feed:
+        pct = int(float(m.get("lastTradePrice", 0)) * 100)
+        vol = float(m.get("volume24hr", 0))
+        cid = m.get("conditionId", "")[:12]
+        in_cooldown = DB_AVAILABLE and db.already_posted(m.get("conditionId", ""))
+        flag = " [cooldown]" if in_cooldown else ""
+        print(f"      {pct}% | ${vol:,.0f}/24h | {cid} | {m['question'][:50]}{flag}")
+
+    if DB_AVAILABLE:
+        db.record_feed_snapshot(feed)
+
+    # ── 2. Pick market ─────────────────────────────────────────────
+    print("\n[2/4] Picking best market...")
+    market = pick_best_market(feed)
+    if not market:
+        print("      No suitable market found")
+        if DB_AVAILABLE:
+            db.record_run("skipped", error_message="no suitable market")
+        return
+
+    pct = int(float(market.get("lastTradePrice", 0)) * 100)
+    vol = float(market.get("volume24hr", 0))
+    market_url = get_market_url(market)
+    cid = market.get("conditionId", "")
+
+    print(f"      Selected: {market['question']}")
+    print(f"      {pct}% YES | ${vol:,.0f}/24h | ends {market.get('endDateIso')}")
+    print(f"      URL: https://{market_url}")
+    print(f"      conditionId: {cid[:20]}...")
+
+    # Record skip for markets that lost out to cooldown
+    if DB_AVAILABLE:
+        for m in feed:
+            if m.get("conditionId") != cid:
+                if db.already_posted(m.get("conditionId", "")):
+                    db.record_skip(m, "cooldown_48hr")
+
+    # ── 3. Generate tweet ──────────────────────────────────────────
+    print("\n[3/4] Generating tweet...")
+    try:
+        tweet = generate_tweet(market, groq_key)
+    except Exception as e:
+        print(f"      ERROR generating tweet: {e}")
+        if DB_AVAILABLE:
+            db.record_run(
+                "error",
+                error_message=f"generation failed: {e}",
+                market_selected=market.get("question", ""),
+            )
+        return
+
+    if not tweet or len(tweet) < 20:
+        print("      ERROR: tweet empty or too short — model may have failed")
+        if DB_AVAILABLE:
+            db.record_run(
+                "error",
+                error_message="empty tweet returned",
+                market_selected=market.get("question", ""),
+            )
+        return
+
+    position = infer_arke_position(tweet)
+
+    print(f"\n{'='*60}")
+    print("TWEET:")
+    print(tweet)
+    print(f"{'='*60}")
+    print(f"Length: {len(tweet)} chars | Position: {position}")
+
+    # ── 4. Post or dry run ─────────────────────────────────────────
+    print("\n[4/4] Posting to OpenTweet...")
+
+    if dry_run:
+        print("      DRY RUN — no post sent, no DB write")
+        print(f"      Verify URL resolves: https://{market_url}")
+        print(f"\n      Run with --post to go live:")
+        print(f"      python prove_the_loop.py --post")
+        duration_ms = int((time.time() - run_start) * 1000)
+        if DB_AVAILABLE:
+            db.record_run(
+                "dry_run",
+                market_selected=market.get("question", ""),
+                duration_ms=duration_ms,
+            )
+        print(f"\nDone. ({duration_ms}ms)")
+        return
+
+    # Live post
+    if not opentweet_key:
+        print("      ERROR: OPENTWEET_API_KEY not set")
+        return
+
+    result = await post_to_opentweet(tweet)
+
+    if result:
+        posts = result.get("posts", [{}])
+        post_id = posts[0].get("id", "unknown") if posts else "unknown"
+        x_post_id = posts[0].get("x_post_id", "") if posts else ""
+        x_url = f"https://x.com/arke_ai/status/{x_post_id}" if x_post_id else ""
+
+        print(f"      Success: post id {post_id}")
+        if x_url:
+            print(f"      X URL: {x_url}")
+
+        # ── DB record ─────────────────────────────────────────────
+        if DB_AVAILABLE:
+            row_id = db.record_post(
+                market=market,
+                tweet_text=tweet,
+                market_url=market_url,
+                opentweet_post_id=post_id,
+                x_post_url=x_url,
+                arke_position=position,
+            )
+            duration_ms = int((time.time() - run_start) * 1000)
+            db.record_run(
+                "posted",
+                market_selected=market.get("question", ""),
+                duration_ms=duration_ms,
+            )
+            print(f"      DB row: {row_id}")
+
+        print(f"\n      Check @arke_ai on X")
+
+    else:
+        print("      Failed — check HTTP status and response above")
+        if DB_AVAILABLE:
+            db.record_run(
+                "error",
+                market_selected=market.get("question", ""),
+                error_message="opentweet post failed",
+            )
+
+    duration_ms = int((time.time() - run_start) * 1000)
+    print(f"\nDone. ({duration_ms}ms)")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+================================================================================
+FILE: requirements.txt
+================================================================================
+httpx==0.27.0
+groq==0.9.0
+python-dotenv==1.0.1
+schedule==1.2.2
+cerebras-cloud-sdk>=1.0.0
+web3==6.20.0
+
+================================================================================
+END OF DUMP — 35 files
+================================================================================
