@@ -1,0 +1,13 @@
+.env
+*.pyc
+__pycache__/
+arke.db
+arke.db-wal
+arke.db-shm
+venv/
+arke_env/
+node_modules/
+.next/
+dist/
+.DS_Store
+*.log
