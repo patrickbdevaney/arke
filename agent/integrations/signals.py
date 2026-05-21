@@ -43,6 +43,34 @@ RSS_FEEDS = [
         "url": "https://cryptopanic.com/news/rss/",
         "timeout": 8.0,
     },
+    # General + geopolitics coverage — gives non-crypto markets (Iran, macro,
+    # elections) real headlines to cite instead of forcing the generator to
+    # invent unverifiable facts.
+    {
+        "name": "BBC World",
+        "url": "https://feeds.bbci.co.uk/news/world/rss.xml",
+        "timeout": 8.0,
+    },
+    {
+        "name": "BBC Middle East",
+        "url": "https://feeds.bbci.co.uk/news/world/middle_east/rss.xml",
+        "timeout": 8.0,
+    },
+    {
+        "name": "Al Jazeera",
+        "url": "https://www.aljazeera.com/xml/rss/all.xml",
+        "timeout": 8.0,
+    },
+    {
+        "name": "Guardian World",
+        "url": "https://www.theguardian.com/world/rss",
+        "timeout": 8.0,
+    },
+    {
+        "name": "NPR World",
+        "url": "https://feeds.npr.org/1004/rss.xml",
+        "timeout": 8.0,
+    },
 ]
 
 GDELT_URL = (

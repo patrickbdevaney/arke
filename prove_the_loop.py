@@ -17,6 +17,7 @@ Run:
 import httpx
 import asyncio
 import os
+import re
 import sys
 import time
 from groq import Groq
@@ -79,6 +80,14 @@ SPORTS_KEYWORDS = [
     "Cubs",
     "Padres",
     "Giants",
+    # Additional sports to filter with wider probability range
+    "Toulouse", "Marseille", "Lyon", "Monaco",
+    "Ligue 1", "Serie A", "Bundesliga", "Eredivisie",
+    "Roland Garros", "Wimbledon", "US Open", "Australian Open",
+    "Tour de France", "Superbowl", "Super Bowl",
+    "World Series", "Stanley Cup", "NBA Finals",
+    "cricket", "rugby", "MLS", "ATP", "WTA",
+    "CS2", "CSGO", "Dota 2", "Overwatch", "PUBG",
 ]
 
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "arke.live")
@@ -205,19 +214,25 @@ def pick_best_market(feed: list[dict]) -> dict | None:
     # Pass 1: urgent, not in cooldown
     urgent = [m for m in feed if not in_cooldown(m) and 0 <= days_left(m) <= 7]
     if urgent:
-        return urgent[0]
+        selected = urgent[0]
+        print(f"      [urgent {days_left(selected)}d] {selected.get('question','')[:60]}")
+        return selected
 
     # Pass 2: medium term, not in cooldown
     medium = [m for m in feed if not in_cooldown(m) and 7 < days_left(m) <= 30]
     if medium:
-        return medium[0]
+        selected = medium[0]
+        print(f"      [medium {days_left(selected)}d] {selected.get('question','')[:60]}")
+        return selected
 
     # Pass 3: any not in cooldown (long-dated)
     available = [m for m in feed if not in_cooldown(m)]
     if available:
-        return available[0]
+        selected = available[0]
+        print(f"      [long-dated] {selected.get('question','')[:60]}")
+        return selected
 
-    # Final fallback
+    # Final fallback: ignore cooldown entirely
     print("      [WARN] All markets in cooldown — falling back to top market")
     return feed[0] if feed else None
 
@@ -227,10 +242,8 @@ def pick_best_market(feed: list[dict]) -> dict | None:
 # ------------------------------------------------------------------ #
 
 
-def generate_tweet(market: dict, groq_api_key: str, news_context: str = "") -> str:
-    """Generate analytical tweet via Groq gpt-oss-120b."""
-    client = Groq(api_key=groq_api_key)
-
+def generate_tweet(market: dict, groq_client, news_context: str = "") -> str:
+    """Generate analytical tweet via Groq using the shared groq_client."""
     price = float(market.get("lastTradePrice", 0.5))
     pct = int(price * 100)
     question = market["question"]
@@ -246,53 +259,56 @@ def generate_tweet(market: dict, groq_api_key: str, news_context: str = "") -> s
 
     news_block = ""
     if news_context:
-        news_block = (
-            f"\n\nBreaking news context (CITE THIS in your take):\n{news_context}"
-            "\n\nYour take MUST reference one specific detail from the breaking news above."
-        )
+        news_block = f"""
 
-    prompt = f"""You are Arke, an autonomous prediction market intelligence agent. You write sharp, analytical tweets that crypto-native traders respect and engage with.
+CURRENT SITUATION (background only — do NOT cite this directly):
+{news_context[:400]}
+
+Use this to understand the present moment. Your line-2 fact must be a
+VERIFIABLE HISTORICAL event, established pattern, or institutional record
+that a fact-checker can confirm from public record — NOT this breaking
+news, which is too recent to verify."""
+
+    prompt = f"""You are Arke, an autonomous prediction market intelligence agent.
+Write a sharp analytical tweet that crypto-native traders respect.
 
 Market: {question}
-Current probability: {pct}% YES
-24hr volume: ${vol24:,.0f} USDC
+Probability: {pct}% YES
+Volume: ${vol24:,.0f} USDC/24h
 Resolves: {end_date}
 Context: {context}{news_block}
 
-TWEET STRUCTURE (follow exactly):
-Line 1: State the event and the market's implied probability as a fact. One sentence. End with a period.
-Line 2: Your take — agree or disagree — with exactly one specific, data-grounded reason. Start with "I think" or "I disagree —". End with a period.
+TWEET STRUCTURE (3 lines, follow exactly):
+Line 1: State the market and probability as fact. One sentence. End with period.
+Line 2: Your take starting with "I think" or "I disagree —". MUST cite ONE
+        specific verifiable fact: a named event, year, organization, or number.
+        NOT vague phrases like "historical patterns" or "market dynamics".
 Line 3: "Bet: {market_url}"
 
-RULES:
-- Total length under 240 characters including the URL
-- The probability must appear as a specific percentage number
-- Your reason must be specific — cite a mechanism, a historical pattern, or a named data point. Never vague generalities
-- Slightly contrarian is better than agreeing with consensus
-- No hashtags, no exclamation marks, no emojis, no ellipses
-- No comma splices — each clause is its own sentence
-- Do not start with "Market says" — vary the opening
-- Return only the tweet text, nothing else
+SPECIFICITY RULES — your take will be rejected if it is vague:
+GOOD: "Iran closed its airspace for 72 hours in April 2019 before IATA pressure forced reopening."
+GOOD: "The Fed has paused rates at 8 of the last 9 meetings since March 2023."
+GOOD: "MicroStrategy's 10-K filed February 2024 showed a 20% increase in BTC holdings."
+BAD: "historical patterns suggest this is unlikely"
+BAD: "market dynamics indicate underpricing"
+BAD: "this seems too high given recent events"
 
-GOOD EXAMPLES:
-"MicroStrategy holds $40B in Bitcoin with zero liquidation pressure. Market prices 55% chance they sell by May 31 — that contradicts every public commitment Saylor has made since 2020.
-Bet: polymarket.com/event/microstrategy-sell-any-bitcoin-in-2025"
+TWEET RULES:
+- Under 240 characters total including URL
+- Specific percentage number must appear in line 1
+- No hashtags, exclamation marks, emojis, ellipses
+- No comma splices — each clause its own sentence
+- Do not start with "Market says"
+- Return only the 3-line tweet, nothing else"""
 
-"Strait of Hormuz at 30% normal traffic by June. Iran has closed it twice before and reopened within weeks under economic pressure. The market is underpricing normalization.
-Bet: polymarket.com/event/strait-of-hormuz-traffic-2026"
-
-BAD EXAMPLES (never do these):
-"Market says 55% chance MicroStrategy sells Bitcoin by May 31, I disagree, Saylor's long term strategy is unchanged" — comma splice, vague reason
-"55% YES on MicroStrategy selling BTC! Interesting market! 🔥" — exclamations, emoji, no take"""
-
-    response = client.chat.completions.create(
+    response = groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.7,
         max_tokens=280,
     )
 
-    return response.choices[0].message.content.strip()
+    return (response.choices[0].message.content or "").strip()
 
 
 # ------------------------------------------------------------------ #
@@ -425,28 +441,48 @@ async def main(post: bool | None = None):
     try:
         from agent.integrations.signals import fetch_headlines
         headlines = await fetch_headlines()
-        # Match headlines to market question
-        question_words = set(
-            w.lower() for w in market.get("question", "").split()
-            if len(w) > 4
-        )
-        relevant = []
-        for h in headlines:
-            title_words = set(h.get("title", "").lower().split())
-            if len(question_words & title_words) >= 2:
-                relevant.append(h["title"])
-        news_context = " | ".join(relevant[:3])
-        if news_context:
-            print(f"      Signal context: {news_context[:100]}...")
+
+        if headlines:
+            question = market.get("question", "").lower()
+
+            # Extract key entities: tokens >=4 chars, not pure digits, not stopwords.
+            # >=4 (not >4) so 4-letter entities like "iran"/"gaza" match — the
+            # critical fix for geopolitics markets that the >4 rule silently dropped.
+            STOPWORDS = {"will", "what", "when", "does", "have", "this",
+                         "that", "with", "from", "they", "their", "been",
+                         "than", "into", "more", "also", "some", "such",
+                         "over", "most", "many", "year", "next", "week",
+                         "days", "time", "like", "just", "only"}
+            question_words = [
+                w for w in re.findall(r"[a-z0-9]+", question)
+                if len(w) >= 4 and not w.isdigit() and w not in STOPWORDS
+            ]
+
+            relevant = []
+            for h in headlines:
+                title_lower = h.get("title", "").lower()
+                # Match if ANY single key word from question appears in headline
+                if any(w in title_lower for w in question_words):
+                    relevant.append(h["title"])
+
+            news_context = " | ".join(relevant[:4])
+            if news_context:
+                print(f"      Signal context ({len(relevant)} matches): {news_context[:120]}...")
+            else:
+                print(f"      No signal match in {len(headlines)} headlines — generating without context")
         else:
-            print("      No relevant signals found — generating without context")
+            print("      No headlines fetched — generating without context")
+
     except Exception as e:
         print(f"      Signal fetch failed: {e} — continuing without context")
+
+    # Groq client — shared by tweet generation and the quality-filter retry loop
+    groq_client = Groq(api_key=groq_key)
 
     # ── 3. Generate tweet ──────────────────────────────────────────
     print("\n[3/4] Generating tweet...")
     try:
-        tweet = generate_tweet(market, groq_key, news_context=news_context)
+        tweet = generate_tweet(market, groq_client, news_context=news_context)
     except Exception as e:
         print(f"      ERROR generating tweet: {e}")
         if DB_AVAILABLE:
@@ -484,16 +520,55 @@ async def main(post: bool | None = None):
     filter_score = 0.8
     filter_passed = True
     filter_reason = "filter_not_run"
-    try:
-        from agent.agents.filter import quality_check
-        filter_score, filter_passed, filter_reason = quality_check(tweet, market)
-        print(f"      Score: {filter_score:.2f} | Passed: {filter_passed} | {filter_reason}")
-    except Exception as e:
-        print(f"      Filter error: {e} — fail-open")
+    MAX_FILTER_RETRIES = 2
+
+    for attempt in range(MAX_FILTER_RETRIES + 1):
+        try:
+            from agent.agents.filter import quality_check
+            filter_score, filter_passed, filter_reason = quality_check(tweet, market)
+            print(f"      Attempt {attempt+1}: score={filter_score:.2f} passed={filter_passed}")
+            if filter_passed:
+                break
+            print(f"      Blocked: {filter_reason}")
+            if attempt < MAX_FILTER_RETRIES:
+                print(f"      Retrying with enriched prompt...")
+                # Retry with a more prescriptive prompt
+                enriched_prompt = f"""Previous take was rejected for being too vague: {filter_reason}
+
+Rewrite this take citing a VERIFIABLE HISTORICAL fact — a named past event
+with a year, or an institutional record a fact-checker can confirm from
+public record. Do NOT cite recent breaking news (too recent to verify).
+
+Market: {market.get('question', '')}
+Probability: {pct}% YES
+Resolves: {market.get('endDateIso', '')}
+{f'Background (do not cite directly): {news_context[:200]}' if news_context else ''}
+
+REQUIREMENTS:
+- Line 1: state market + probability as fact
+- Line 2: start with "I think" or "I disagree —" + cite a specific past
+  event, year, or named institution that can be independently verified.
+- Line 3: "Bet: {market_url}"
+- Under 240 chars total
+- No vague phrases. Specific verifiable facts only.
+- Return only the 3-line tweet."""
+
+                retry_response = groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[{"role": "user", "content": enriched_prompt}],
+                    temperature=0.5,
+                    max_tokens=280,
+                )
+                tweet = (retry_response.choices[0].message.content or "").strip()
+                position = infer_arke_position(tweet)
+                print(f"      Retry tweet: {tweet[:100]}...")
+        except Exception as e:
+            print(f"      Filter error: {e} — fail-open")
+            filter_passed = True
+            break
 
     if not filter_passed:
-        print(f"      BLOCKED by quality filter — skipping post")
-        print(f"      Reason: {filter_reason}")
+        print(f"      BLOCKED after {MAX_FILTER_RETRIES+1} attempts — skipping post")
         if DB_AVAILABLE:
             db.record_run(
                 "skipped",
