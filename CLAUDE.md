@@ -23,6 +23,24 @@ runs a multi-agent council, and posts analytical tweets as **@arke_ai**.
 - Note: `POLY_BUILDER_CODE` / `POLY_BUILDER_ADDRESS` are **public** (they appear in
   every tweet's `?ref=` URL) — not secrets.
 
+## Sensitive data — operating procedure (how to handle secrets & infra)
+
+This repo is **public**: everything tracked by git is world-readable, now and in history.
+
+**Never put in a tracked file** (code, this file, `.env.example`, specs): credential values,
+real IPs / hostnames, SSH targets, internal URLs, or private operational detail.
+
+**Put sensitive operational info in gitignored `*.local.md` files instead.** `.gitignore`
+already excludes `*.local.md` and `SECURITY_THREAT_MODEL.md`. Current local-only docs:
+- `OPERATIONS.local.md` — VPS host/IP, deploy path, SSH + deploy commands, ops gotchas.
+- `SECURITY_THREAT_MODEL.md` — threat model, funds levers, hardening, incident response.
+
+**Procedure:** when recording or referencing something sensitive, create/update a `*.local.md`
+file (never a tracked file) and refer to it from tracked files **by name only**
+(e.g. "see `OPERATIONS.local.md`"). The pre-commit hook blocks key *formats* but does **not**
+catch IPs/hostnames — keeping those out of tracked files is on you. When in doubt, it goes in
+a `.local.md`.
+
 ## Architecture
 
 - **Entry point:** `agent/scheduler.py` imports `main` from `prove_the_loop.py`.
@@ -51,7 +69,8 @@ runs a multi-agent council, and posts analytical tweets as **@arke_ai**.
 
 ## Run / deploy
 
-- Local venv: `arke_env/`. VPS: `root@159.223.102.247:/opt/arke`, venv `venv/`.
+- Local venv: `arke_env/`. VPS host, deploy path, and SSH details are in `OPERATIONS.local.md`
+  (gitignored — see "Sensitive data" above).
 - Dry run: `arke_env/bin/python prove_the_loop.py`
 - Deploy: push `main`, then on VPS `git pull && venv/bin/pip install -r requirements.txt
   && systemctl restart arke`. **Restarting `arke` triggers an immediate live post.**

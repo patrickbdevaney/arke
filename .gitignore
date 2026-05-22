@@ -13,6 +13,10 @@ id_ed25519
 secrets.json
 .secrets
 
+# Local-only security notes / threat model — never publish
+SECURITY_THREAT_MODEL.md
+*.local.md
+
 *.pyc
 __pycache__/
 arke.db
