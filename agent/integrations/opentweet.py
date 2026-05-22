@@ -1,71 +1,90 @@
 """
-agent/integrations/opentweet.py — OpenTweet API integration
+agent/integrations/opentweet.py — Direct X API posting via tweepy
+
+Replaces OpenTweet with direct X API v2 using OAuth 1.0a.
+Four credentials required in .env:
+  X_API_KEY            — Consumer Key
+  X_API_SECRET         — Consumer Secret
+  X_ACCESS_TOKEN       — Access Token (for @arke_ai)
+  X_ACCESS_TOKEN_SECRET — Access Token Secret
+
+No token expiry. No refresh needed. Posts immediately.
 
 Provides:
-  post_tweet(tweet: str) -> dict   — posts to @arke_ai, returns response
-  remaining_credits() -> int       — checks remaining URL post credits
+  post_tweet(tweet: str) -> dict
+  remaining_credits() -> int
 """
 
 import os
 import logging
+import tweepy
 
-import httpx
-from dotenv import load_dotenv
+log = logging.getLogger(__name__)
 
-load_dotenv()
 
-logger = logging.getLogger(__name__)
+def _cred(*names: str) -> str | None:
+    """Return the first non-empty env var among names.
 
-POSTS_URL = "https://opentweet.io/api/v1/posts"
-ME_URL = "https://opentweet.io/api/v1/me"
+    This deployment's .env names the OAuth 1.0a consumer credentials
+    X_API_CONSUMER_KEY / X_API_SECRET_KEY. The spec's canonical names are
+    X_API_KEY / X_API_SECRET. Accept either, preferring the canonical name.
+    """
+    for n in names:
+        v = os.getenv(n)
+        if v:
+            return v
+    return None
+
+
+def _consumer_key() -> str | None:
+    return _cred("X_API_KEY", "X_API_CONSUMER_KEY")
+
+
+def _consumer_secret() -> str | None:
+    return _cred("X_API_SECRET", "X_API_SECRET_KEY")
+
+
+def _get_client() -> tweepy.Client:
+    return tweepy.Client(
+        consumer_key=_consumer_key(),
+        consumer_secret=_consumer_secret(),
+        access_token=os.getenv("X_ACCESS_TOKEN"),
+        access_token_secret=os.getenv("X_ACCESS_TOKEN_SECRET"),
+    )
 
 
 async def post_tweet(tweet: str) -> dict:
-    """POST tweet to OpenTweet. Returns response JSON on 2xx, else empty dict."""
-    api_key = os.getenv("OPENTWEET_API_KEY")
+    """Post tweet via X API v2. Returns response dict or empty on failure."""
+    api_key = _consumer_key()
     if not api_key:
-        logger.warning("[OpenTweet] OPENTWEET_API_KEY not set — skipping post")
+        log.warning("[X] consumer key not set (X_API_KEY / X_API_CONSUMER_KEY) — skipping post")
         return {}
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                POSTS_URL,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={"text": tweet, "publish_now": True},
-            )
-            logger.info(f"[OpenTweet] HTTP {resp.status_code}")
-            if resp.status_code in (200, 201):
-                return resp.json()
-            logger.error(f"[OpenTweet] error body: {resp.text[:300]}")
-            return {}
+        client = _get_client()
+        response = client.create_tweet(text=tweet)
+        tweet_id = response.data["id"]
+        x_url = f"https://x.com/arke_ai/status/{tweet_id}"
+        log.info(f"[X] Posted successfully: {x_url}")
+        return {
+            "posts": [{
+                "id": tweet_id,
+                "x_post_id": tweet_id,
+                "x_url": x_url,
+                "status": "posted",
+            }]
+        }
+    except tweepy.errors.Forbidden as e:
+        log.error(f"[X] Forbidden — check app permissions are Read+Write: {e}")
+        return {}
+    except tweepy.errors.Unauthorized as e:
+        log.error(f"[X] Unauthorized — check credentials in .env: {e}")
+        return {}
     except Exception as e:
-        logger.error(f"[OpenTweet] request failed: {e}")
+        log.error(f"[X] Post failed: {e}")
         return {}
 
 
 async def remaining_credits() -> int:
-    """GET /me; return limits.remaining_posts_today, or -1 on failure."""
-    api_key = os.getenv("OPENTWEET_API_KEY")
-    if not api_key:
-        logger.warning("[OpenTweet] OPENTWEET_API_KEY not set")
-        return -1
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                ME_URL,
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
-            if resp.status_code != 200:
-                logger.warning(f"[OpenTweet] /me HTTP {resp.status_code}")
-                return -1
-            data = resp.json()
-            limits = data.get("limits", {}) or {}
-            return int(limits.get("remaining_posts_today", -1))
-    except Exception as e:
-        logger.error(f"[OpenTweet] /me failed: {e}")
-        return -1
+    """Always returns 99 — X API pay-per-use has no daily limit concept."""
+    return 99

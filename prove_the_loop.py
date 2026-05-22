@@ -6,12 +6,12 @@ Chain:
 2. Pick best market — urgency + volume, non-sports, 20-80% probability
 3. Check SQLite deduplication — skip if posted within 48 hours
 4. Call Groq gpt-oss-120b to generate analytical tweet
-5. Post to @arke_ai via OpenTweet API
+5. Post to @arke_ai via the direct X API (tweepy, OAuth 1.0a)
 6. Record to SQLite with builder code attribution
 
 Run:
   python prove_the_loop.py          # dry run — safe, no post, no db write
-  python prove_the_loop.py --post   # live post, burns one OpenTweet credit
+  python prove_the_loop.py --post   # live post via the direct X API
 """
 
 import httpx
@@ -316,30 +316,22 @@ TWEET RULES:
 # ------------------------------------------------------------------ #
 
 
-async def post_to_opentweet(tweet: str) -> dict:
-    """Post via OpenTweet API. Returns response dict or empty on failure."""
-    api_key = os.getenv("OPENTWEET_API_KEY")
-    if not api_key:
-        print("      OPENTWEET_API_KEY not set — skipping post")
-        return {}
+async def post_to_x(tweet: str) -> dict:
+    """Post via the direct X API (tweepy) — see agent/integrations/opentweet.py.
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.post(
-            "https://opentweet.io/api/v1/posts",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "text": tweet,
-                "publish_now": True,
-            },
-        )
-        print(f"      HTTP {resp.status_code}")
-        print(f"      Response: {resp.text[:300]}")
-        if resp.status_code in (200, 201):
-            return resp.json()
-        return {}
+    Returns the post-response dict (OpenTweet-compatible {"posts": [...]}) or
+    an empty dict on failure.
+    """
+    from agent.integrations.opentweet import post_tweet
+
+    result = await post_tweet(tweet)
+    if result:
+        posts = result.get("posts", [{}])
+        x_url = posts[0].get("x_url", "") if posts else ""
+        print(f"      X API post accepted{(' — ' + x_url) if x_url else ''}")
+    else:
+        print("      X API post failed — see [X] log lines above for the reason")
+    return result
 
 
 # ------------------------------------------------------------------ #
@@ -361,12 +353,10 @@ async def main(post: bool | None = None):
     # ── Env check ──────────────────────────────────────────────────
     print("DEBUG: loading env vars...")
     groq_key = os.getenv("GROQ_API_KEY")
-    opentweet_key = os.getenv("OPENTWEET_API_KEY")
+    x_consumer = os.getenv("X_API_KEY") or os.getenv("X_API_CONSUMER_KEY")
 
     print(f"DEBUG: GROQ_API_KEY      = {groq_key[:10] if groq_key else 'NOT SET'}")
-    print(
-        f"DEBUG: OPENTWEET_API_KEY = {opentweet_key[:10] if opentweet_key else 'NOT SET'}"
-    )
+    print(f"DEBUG: X_API consumer    = {'SET' if x_consumer else 'NOT SET'}")
     print(
         f"DEBUG: BUILDER_CODE      = {BUILDER_CODE[:16] if BUILDER_CODE else 'NOT SET'}"
     )
@@ -579,7 +569,7 @@ REQUIREMENTS:
         return
 
     # ── 4. Post or dry run ─────────────────────────────────────────
-    print("\n[4/4] Posting to OpenTweet...")
+    print("\n[4/4] Posting to X...")
 
     if dry_run:
         print("      DRY RUN — no post sent, no DB write")
@@ -597,11 +587,11 @@ REQUIREMENTS:
         return
 
     # Live post
-    if not opentweet_key:
-        print("      ERROR: OPENTWEET_API_KEY not set")
+    if not (os.getenv("X_API_KEY") or os.getenv("X_API_CONSUMER_KEY")):
+        print("      ERROR: X API consumer key not set (X_API_KEY / X_API_CONSUMER_KEY)")
         return
 
-    result = await post_to_opentweet(tweet)
+    result = await post_to_x(tweet)
 
     if result:
         posts = result.get("posts", [{}])
