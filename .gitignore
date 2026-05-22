@@ -1,4 +1,18 @@
+# ── Secrets — never commit. Real env files stay local; templates go in .env.example ──
 .env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.pem
+*.key
+*.p12
+*.keystore
+id_rsa
+id_ed25519
+secrets.json
+.secrets
+
 *.pyc
 __pycache__/
 arke.db

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Arke pre-commit secret guard — blocks commits that add secrets or real env files.
+#
+# Version-controlled and shared across all clones via:
+#     git config core.hooksPath .githooks      (run scripts/install-hooks.sh once)
+#
+# Emergency bypass (use sparingly, only for confirmed false positives):
+#     git commit --no-verify
+
+fail=0
+
+# ── 1) Never commit a real env file (templates .env.example/.sample/.template are fine)
+for f in $(git diff --cached --name-only --diff-filter=ACM); do
+  case "$(basename "$f")" in
+    .env.example|.env.sample|.env.template) : ;;
+    .env|.env.*) echo "BLOCKED: refusing to commit env file: $f"; fail=1 ;;
+  esac
+done
+
+# ── 2) Scan staged additions for known secret formats (value shapes, not var names,
+#       so empty placeholders like FOO_API_KEY= and public 0x… hashes don't trip it)
+PATTERNS='gsk_[A-Za-z0-9]{20,}|csk-[a-z0-9]{20,}|ot_[a-f0-9]{20,}|sk-(proj-)?[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16}|gh[posru]_[A-Za-z0-9]{20,}|xox[baprs]-[0-9A-Za-z-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+hits=$(git diff --cached --diff-filter=ACM -U0 | grep '^+' | grep -vE '^\+\+\+' | grep -En "$PATTERNS")
+if [ -n "$hits" ]; then
+  echo "BLOCKED: possible secret(s) in staged changes:"
+  printf '%s\n' "$hits" | sed -E 's/(gsk_|csk-|ot_|sk-|AIza|AKIA|ghp_|xox.-)[A-Za-z0-9_-]+/\1…REDACTED/g' | head -10
+  fail=1
+fi
+
+# ── 3) Deeper scan with gitleaks if it is installed (optional, stronger coverage)
+if command -v gitleaks >/dev/null 2>&1; then
+  if ! gitleaks protect --staged --redact --no-banner >/dev/null 2>&1; then
+    echo "BLOCKED: gitleaks flagged staged changes:"
+    gitleaks protect --staged --redact --no-banner 2>&1 | tail -15
+    fail=1
+  fi
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo
+  echo "Commit aborted. Secrets belong in .env (gitignored) and are read via os.getenv()."
+  echo "Document new vars (empty) in .env.example. False positive? git commit --no-verify"
+  exit 1
+fi
+exit 0
