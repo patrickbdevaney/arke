@@ -425,147 +425,109 @@ async def main(post: bool | None = None):
                 if db.already_posted(m.get("conditionId", "")):
                     db.record_skip(m, "cooldown_48hr")
 
-    # ── 2.5. Fetch signal context ──────────────────────────────────
-    print("\n[2.5/4] Fetching signal context...")
+    # ── 2.5: Signal Agent ─────────────────────────────────────────────
+    print("\n[2.5/4] Signal Agent — aggregating context...")
     news_context = ""
+    signal_report = ""
     try:
         from agent.integrations.signals import fetch_headlines
+        from agent.agents.signal_agent import run_signal_agent
+
         headlines = await fetch_headlines()
-
         if headlines:
-            question = market.get("question", "").lower()
+            # Match headlines to market using key entity words
+            question_lower = market.get("question", "").lower()
+            STOPWORDS = {"will", "what", "when", "does", "have", "this", "that",
+                         "with", "from", "they", "their", "been", "than", "into"}
+            q_words = [w for w in question_lower.split()
+                       if len(w) > 4 and w not in STOPWORDS]
+            matched = [h.get("title", "") for h in headlines
+                       if any(w in h.get("title", "").lower() for w in q_words)]
 
-            # Extract key entities: tokens >=4 chars, not pure digits, not stopwords.
-            # >=4 (not >4) so 4-letter entities like "iran"/"gaza" match — the
-            # critical fix for geopolitics markets that the >4 rule silently dropped.
-            STOPWORDS = {"will", "what", "when", "does", "have", "this",
-                         "that", "with", "from", "they", "their", "been",
-                         "than", "into", "more", "also", "some", "such",
-                         "over", "most", "many", "year", "next", "week",
-                         "days", "time", "like", "just", "only"}
-            question_words = [
-                w for w in re.findall(r"[a-z0-9]+", question)
-                if len(w) >= 4 and not w.isdigit() and w not in STOPWORDS
-            ]
-
-            relevant = []
-            for h in headlines:
-                title_lower = h.get("title", "").lower()
-                # Match if ANY single key word from question appears in headline
-                if any(w in title_lower for w in question_words):
-                    relevant.append(h["title"])
-
-            news_context = " | ".join(relevant[:4])
-            if news_context:
-                print(f"      Signal context ({len(relevant)} matches): {news_context[:120]}...")
+            print(f"      {len(headlines)} headlines fetched, {len(matched)} matched")
+            if matched:
+                news_context = " | ".join(matched[:4])
+                signal_report = run_signal_agent(market, matched[:8])
+                if signal_report:
+                    print(f"      Signal report: {signal_report[:100]}...")
             else:
-                print(f"      No signal match in {len(headlines)} headlines — generating without context")
-        else:
-            print("      No headlines fetched — generating without context")
-
+                print("      No headline matches — proceeding without context")
     except Exception as e:
-        print(f"      Signal fetch failed: {e} — continuing without context")
+        print(f"      Signal agent failed: {e} — continuing")
 
-    # Groq client — shared by tweet generation and the quality-filter retry loop
-    groq_client = Groq(api_key=groq_key)
+    # ── 3: Forecaster Agent ───────────────────────────────────────────
+    print("\n[3/4] Forecaster Agent — generating probability estimate...")
+    from agent.agents.forecaster_agent import run_forecaster_agent
 
-    # ── 3. Generate tweet ──────────────────────────────────────────
-    print("\n[3/4] Generating tweet...")
-    try:
-        tweet = generate_tweet(market, groq_client, news_context=news_context)
-    except Exception as e:
-        print(f"      ERROR generating tweet: {e}")
+    tweet = ""
+    arke_pct = int(float(market.get("lastTradePrice", 0)) * 100)
+
+    for attempt in range(3):
+        try:
+            tweet, arke_pct = run_forecaster_agent(market, signal_report, market_url)
+            if tweet and len(tweet) > 20:
+                break
+            print(f"      Attempt {attempt+1}: empty response — retrying")
+        except Exception as e:
+            print(f"      Attempt {attempt+1} failed: {e}")
+            if attempt == 2:
+                if DB_AVAILABLE:
+                    db.record_run("error",
+                        market_selected=market.get("question", ""),
+                        error_message=f"forecaster failed: {e}")
+                return
+
+    if not tweet:
+        print("      Forecaster produced no tweet — skipping")
         if DB_AVAILABLE:
-            db.record_run(
-                "error",
-                error_message=f"generation failed: {e}",
+            db.record_run("error",
                 market_selected=market.get("question", ""),
-            )
+                error_message="forecaster empty tweet")
         return
 
-    if not tweet or len(tweet) < 20:
-        print("      ERROR: tweet empty or too short — model may have failed")
-        if DB_AVAILABLE:
-            db.record_run(
-                "error",
-                error_message="empty tweet returned",
-                market_selected=market.get("question", ""),
-            )
-        return
-
-    position = infer_arke_position(tweet)
-    arke_prob = infer_arke_probability(tweet, pct)
+    market_pct = int(float(market.get("lastTradePrice", 0)) * 100)
+    edge = arke_pct - market_pct
+    position = "AGREE" if abs(edge) <= 3 else ("BULL" if edge > 0 else "BEAR")
 
     print(f"\n{'='*60}")
     print("TWEET:")
     print(tweet)
     print(f"{'='*60}")
-    print(
-        f"Length: {len(tweet)} chars | Position: {position} | "
-        f"Market: {pct}% | Arke: {arke_prob}% | Edge: {arke_prob - pct:+d}pts"
-    )
+    print(f"Length: {len(tweet)} | Market: {market_pct}% | Arke: {arke_pct}% | Edge: {edge:+d}pts | {position}")
 
-    # ── 3.5. Quality filter ────────────────────────────────────────
-    print("\n[3.5/4] Quality filter...")
-    filter_score = 0.8
-    filter_passed = True
-    filter_reason = "filter_not_run"
-    MAX_FILTER_RETRIES = 2
+    # ── 3.5: Adversary Agent + Quality Filter ─────────────────────────
+    print("\n[3.5/4] Adversary Agent + Quality Filter...")
+    from agent.agents.adversary_agent import run_adversary_agent
+    from agent.agents.filter import quality_check
 
-    for attempt in range(MAX_FILTER_RETRIES + 1):
-        try:
-            from agent.agents.filter import quality_check
-            filter_score, filter_passed, filter_reason = quality_check(tweet, market)
-            print(f"      Attempt {attempt+1}: score={filter_score:.2f} passed={filter_passed}")
-            if filter_passed:
-                break
-            print(f"      Blocked: {filter_reason}")
-            if attempt < MAX_FILTER_RETRIES:
-                print(f"      Retrying with enriched prompt...")
-                # Retry with a more prescriptive prompt
-                enriched_prompt = f"""Previous take was rejected for being too vague: {filter_reason}
+    # Adversary first
+    tweet, adversary_passed = run_adversary_agent(tweet, market, market_url)
+    print(f"      Adversary: {'PASS' if adversary_passed else 'REWRITE'}")
 
-Rewrite this take citing a VERIFIABLE HISTORICAL fact — a named past event
-with a year, or an institutional record a fact-checker can confirm from
-public record. Do NOT cite recent breaking news (too recent to verify).
-
-Market: {market.get('question', '')}
-Probability: {pct}% YES
-Resolves: {market.get('endDateIso', '')}
-{f'Background (do not cite directly): {news_context[:200]}' if news_context else ''}
-
-REQUIREMENTS:
-- Line 1: state market + probability as fact
-- Line 2: start with "I think" or "I disagree —" + cite a specific past
-  event, year, or named institution that can be independently verified.
-- Line 3: "Bet: {market_url}"
-- Under 240 chars total
-- No vague phrases. Specific verifiable facts only.
-- Return only the 3-line tweet."""
-
-                retry_response = groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[{"role": "user", "content": enriched_prompt}],
-                    temperature=0.5,
-                    max_tokens=280,
-                )
-                tweet = (retry_response.choices[0].message.content or "").strip()
-                position = infer_arke_position(tweet)
-                print(f"      Retry tweet: {tweet[:100]}...")
-        except Exception as e:
-            print(f"      Filter error: {e} — fail-open")
-            filter_passed = True
+    # Quality filter with up to 2 retries
+    filter_score, filter_passed, filter_reason = 0.8, True, "not_run"
+    for attempt in range(3):
+        filter_score, filter_passed, filter_reason = quality_check(tweet, market)
+        print(f"      Filter attempt {attempt+1}: score={filter_score:.2f} passed={filter_passed}")
+        if filter_passed:
             break
+        if attempt < 2:
+            print(f"      Retrying forecaster with enriched prompt...")
+            # Force another forecaster attempt with the rejection reason
+            enriched_signal = (signal_report or "") + f"\n\nPREVIOUS ATTEMPT REJECTED: {filter_reason}\nMust cite a more specific verifiable fact."
+            tweet, arke_pct = run_forecaster_agent(market, enriched_signal, market_url)
+
+    # Recompute edge/position in case a retry changed Arke's estimate
+    edge = arke_pct - market_pct
+    position = "AGREE" if abs(edge) <= 3 else ("BULL" if edge > 0 else "BEAR")
 
     if not filter_passed:
-        print(f"      BLOCKED after {MAX_FILTER_RETRIES+1} attempts — skipping post")
+        print(f"      BLOCKED after 3 attempts — skipping post")
         if DB_AVAILABLE:
-            db.record_run(
-                "skipped",
+            db.record_run("skipped",
                 market_selected=market.get("question", ""),
-                error_message=f"quality_filter_blocked: {filter_reason}",
-            )
-        print(f"\nDone.")
+                error_message=f"quality_blocked: {filter_reason}")
+        print("\nDone.")
         return
 
     # ── 4. Post or dry run ─────────────────────────────────────────
@@ -614,7 +576,7 @@ REQUIREMENTS:
                 arke_position=position,
                 quality_score=filter_score,
                 quality_passed=filter_passed,
-                arke_probability_pct=arke_prob,
+                arke_probability_pct=arke_pct,
                 news_context=news_context,
             )
             duration_ms = int((time.time() - run_start) * 1000)
@@ -624,6 +586,22 @@ REQUIREMENTS:
                 duration_ms=duration_ms,
             )
             print(f"      DB row: {row_id}")
+
+        # ── Onchain oracle log ──────────────────────────────────────
+        try:
+            from agent.integrations.oracle import log_prediction_onchain
+            tx_hash = log_prediction_onchain(
+                condition_id=cid,
+                question=market.get("question", ""),
+                market_pct=market_pct,
+                arke_pct=arke_pct,
+            )
+            if tx_hash:
+                print(f"      Oracle: {tx_hash[:20]}...")
+            else:
+                print(f"      Oracle: skipped (no key or contract)")
+        except Exception as e:
+            print(f"      Oracle: failed silently ({e})")
 
         print(f"\n      Check @arke_ai on X")
 

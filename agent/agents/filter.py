@@ -1,121 +1,132 @@
 """
-agent/agents/filter.py — Quality filter via Gemini 2.5 Flash
+agent/agents/filter.py — Quality gate for generated tweets
 
-Free tier from Google AI Studio — no credit card, no expiration.
-Uses Google Search grounding to verify factual claims in tweets.
-Get key: aistudio.google.com → Get API key
+Uses Groq openai/gpt-oss-120b as the judge model.
+Separate model from generator (llama-3.3-70b-versatile) so
+rate limits don't interfere — each model has its own 1K RPD bucket.
 
-Provides:
-  quality_check(tweet: str, market: dict) -> tuple[float, bool, str]
-    Returns: (score 0-1, passed bool, reason string)
+Scoring:
+  factual    0.0-1.0  — does the take cite verifiable facts?
+  specific   0.0-1.0  — is the reasoning specific, not vague?
+  credible   0.0-1.0  — would a prediction market trader find this credible?
+  composite  weighted average, threshold 0.65 to pass
+
+Fail-open: if the API call fails for any reason, returns passed=True
+so the pipeline doesn't stall.
 """
 
 import os
 import json
-import re
 import logging
-import urllib.request
-import urllib.error
+from groq import Groq
 
 log = logging.getLogger(__name__)
 
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models"
-    "/gemini-2.5-flash:generateContent"
-)
-THRESHOLD = 0.65
+JUDGE_MODEL = "openai/gpt-oss-120b"
+PASS_THRESHOLD = 0.65
 
 
 def quality_check(tweet: str, market: dict) -> tuple[float, bool, str]:
-    """Score tweet quality via Gemini 2.5 Flash. Fail-open on any error."""
-    api_key = os.getenv("GEMINI_API_KEY")
+    """
+    Evaluate tweet quality using Groq judge model.
+
+    Returns:
+        (score, passed, reason)
+        score: float 0.0-1.0
+        passed: bool
+        reason: explanation string
+    """
+    api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
-        log.warning("[Filter] GEMINI_API_KEY not set — fail-open (0.8)")
-        return 0.8, True, "filter_skipped_no_key"
+        log.warning("[Filter] GROQ_API_KEY not set — fail open")
+        return 0.8, True, "no_api_key_fail_open"
 
     question = market.get("question", "")
-    pct = int(float(market.get("lastTradePrice", 0.5) or 0.5) * 100)
-    vol24 = float(market.get("volume24hr", 0) or 0)
+    pct = int(float(market.get("lastTradePrice", 0)) * 100)
 
-    prompt = f"""You are a strict fact-checker for prediction market tweets.
+    prompt = f"""You are evaluating a prediction market tweet for quality.
+
+Market: {question}
+Market probability: {pct}% YES
 
 Tweet to evaluate:
 {tweet}
 
-Market context: {question} — {pct}% YES probability, ${vol24:,.0f} daily volume
+Score this tweet on three dimensions from 0.0 to 1.0:
 
-Score on three dimensions (0.0 to 1.0 each):
-1. factual: Are specific claims verifiable? If a specific number, date, or event is cited, can you verify it from your knowledge? Score 0.1-0.2 for claims you cannot verify.
-2. specific: Does line 2 cite a named mechanism, historical event, specific date, or real data point? Generic phrases like "historical patterns" or "market dynamics" score 0.2.
-3. credible: Would a sophisticated prediction market trader find this analytical take credible and worth engaging with?
+1. factual: Does line 2 cite a specific verifiable fact?
+   A named event, year, organization, or number that can be checked?
+   1.0 = specific verifiable fact cited
+   0.5 = somewhat specific but could be more precise
+   0.0 = vague generality like "historical patterns" or "market dynamics"
 
-Critical rule: "I think this is low/high given historical patterns" scores 0.2 on specificity. Real specificity looks like "Iran closed its airspace 3 times in 2023" or "Saylor has publicly committed to never selling since 2020".
+2. specific: Is the reasoning precise and testable?
+   1.0 = a reader could verify the claim independently
+   0.5 = partially specific
+   0.0 = completely vague, no way to verify
 
-Return ONLY valid JSON, nothing else:
-{{"score": 0.0, "factual": 0.0, "specific": 0.0, "credible": 0.0, "reason": "one sentence explaining the weakest element"}}"""
+3. credible: Would an informed prediction market trader find this take credible?
+   1.0 = sharp analytical take grounded in evidence
+   0.5 = reasonable but not particularly insightful
+   0.0 = unsupported, contradictory, or obviously wrong
+
+Respond with ONLY valid JSON, no other text:
+{{
+  "factual": 0.0,
+  "specific": 0.0,
+  "credible": 0.0,
+  "reason": "one sentence explanation"
+}}"""
 
     try:
-        payload = json.dumps({
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                # 2.5 Flash burns "thinking" tokens against this budget; disable
-                # thinking and use JSON mode so the full structured response fits.
-                "maxOutputTokens": 1024,
-                "temperature": 0.1,
-                "responseMimeType": "application/json",
-                "thinkingConfig": {"thinkingBudget": 0},
-            }
-        }).encode("utf-8")
-
-        req = urllib.request.Request(
-            f"{GEMINI_URL}?key={api_key}",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST"
+        client = Groq(api_key=api_key)
+        response = client.chat.completions.create(
+            model=JUDGE_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            # gpt-oss-120b is a reasoning model: it spends ~500-600 tokens on
+            # hidden reasoning before emitting the JSON. 200 truncates the JSON
+            # (finish_reason=length) and the filter fails open. Give it room.
+            max_tokens=1024,
         )
 
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        raw = (response.choices[0].message.content or "").strip()
 
-        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        # Strip markdown fences if present
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        raw = raw.strip()
 
-        # Strip markdown code fences (Gemini commonly wraps JSON in ```json ... ```)
-        fence = re.match(r"^```(?:json)?\s*([\s\S]*?)\s*```\s*$", text)
-        if fence:
-            text = fence.group(1).strip()
-
-        result = None
         try:
-            result = json.loads(text)
-        except Exception:
-            # Greedy match — captures full JSON even if reason contains nested braces
-            m = re.search(r"\{[\s\S]*\}", text)
-            if m:
-                try:
-                    result = json.loads(m.group(0))
-                except Exception:
-                    result = None
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            # Model occasionally wraps the JSON in prose — grab the first object.
+            import re
+            m = re.search(r"\{[\s\S]*\}", raw)
+            if not m:
+                raise
+            data = json.loads(m.group(0))
+        factual  = float(data.get("factual",  0.5))
+        specific = float(data.get("specific", 0.5))
+        credible = float(data.get("credible", 0.5))
+        reason   = data.get("reason", "")
 
-        if result is None:
-            log.warning(f"[Filter] no JSON in response: {text[:200]} — fail-open")
-            return 0.75, True, "filter_unparseable"
-        factual  = float(result.get("factual",  0.0) or 0.0)
-        specific = float(result.get("specific", 0.0) or 0.0)
-        credible = float(result.get("credible", 0.0) or 0.0)
-        score    = (factual * 0.5) + (specific * 0.25) + (credible * 0.25)
-        passed   = score >= THRESHOLD
-        reason   = str(result.get("reason", ""))[:240]
+        # Weighted composite: factual and specific matter most
+        score = (factual * 0.4) + (specific * 0.4) + (credible * 0.2)
+        passed = score >= PASS_THRESHOLD
 
         log.info(
-            f"[Filter] score={score:.2f} factual={factual:.1f} "
-            f"specific={specific:.1f} credible={credible:.1f} "
+            f"[Filter] score={score:.2f} factual={factual} "
+            f"specific={specific} credible={credible} "
             f"passed={passed} | {reason}"
         )
         return score, passed, reason
 
-    except urllib.error.HTTPError as e:
-        log.warning(f"[Filter] Gemini HTTP {e.code}: {e.read()[:100]} — fail-open")
-        return 0.75, True, f"filter_http_{e.code}"
+    except json.JSONDecodeError as e:
+        log.warning(f"[Filter] JSON parse failed: {e} — fail open")
+        return 0.8, True, f"json_parse_error_fail_open"
     except Exception as e:
-        log.warning(f"[Filter] Gemini failed: {e} — fail-open")
-        return 0.75, True, f"filter_error: {str(e)[:60]}"
+        log.warning(f"[Filter] API error: {e} — fail open")
+        return 0.8, True, f"api_error_fail_open: {str(e)[:80]}"
