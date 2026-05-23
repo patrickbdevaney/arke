@@ -6,10 +6,14 @@ Separate model from generator (llama-3.3-70b-versatile) so
 rate limits don't interfere — each model has its own 1K RPD bucket.
 
 Scoring:
-  factual    0.0-1.0  — does the take cite verifiable facts?
-  specific   0.0-1.0  — is the reasoning specific, not vague?
-  credible   0.0-1.0  — would a prediction market trader find this credible?
-  composite  weighted average, threshold 0.65 to pass
+  factual     0.0-1.0  — does the take cite verifiable facts?
+  specific    0.0-1.0  — is the reasoning specific, not vague?
+  directional 0.0-1.0  — does the cited evidence actually support the
+                         probability estimate's DIRECTION? (a real fact used
+                         as a non-sequitur scores near 0)
+  credible    0.0-1.0  — would a prediction market trader find this credible?
+  composite   factual*0.25 + specific*0.30 + directional*0.30 + credible*0.15,
+              threshold 0.65 to pass
 
 Fail-open: if the API call fails for any reason, returns passed=True
 so the pipeline doesn't stall.
@@ -52,7 +56,7 @@ Market probability: {pct}% YES
 Tweet to evaluate:
 {tweet}
 
-Score this tweet on three dimensions from 0.0 to 1.0:
+Score this tweet on four dimensions from 0.0 to 1.0:
 
 1. factual: Does line 2 cite a specific verifiable fact?
    A named event, year, organization, or number that can be checked?
@@ -65,7 +69,18 @@ Score this tweet on three dimensions from 0.0 to 1.0:
    0.5 = partially specific
    0.0 = completely vague, no way to verify
 
-3. credible: Would an informed prediction market trader find this take credible?
+3. directional: Does the cited evidence ACTUALLY SUPPORT the probability
+   estimate's direction? This is the hardest test — a fact can be real,
+   specific, and verifiable yet prove NOTHING about the estimate.
+   1.0 = clear logical chain from the cited evidence to the % estimate
+   0.5 = evidence is relevant but the link to the direction is weak
+   0.1 = evidence is real and topically related but makes NO directional
+         argument. Example: "Arke estimates 70% — the JCPOA shows diplomacy
+         is possible" — the JCPOA is a real named event, but it does not
+         argue for 70% over any other number. Score directional≈0.1.
+   0.0 = evidence contradicts the estimate's direction
+
+4. credible: Would an informed prediction market trader find this take credible?
    1.0 = sharp analytical take grounded in evidence
    0.5 = reasonable but not particularly insightful
    0.0 = unsupported, contradictory, or obviously wrong
@@ -74,6 +89,7 @@ Respond with ONLY valid JSON, no other text:
 {{
   "factual": 0.0,
   "specific": 0.0,
+  "directional": 0.0,
   "credible": 0.0,
   "reason": "one sentence explanation"
 }}"""
@@ -108,18 +124,26 @@ Respond with ONLY valid JSON, no other text:
             if not m:
                 raise
             data = json.loads(m.group(0))
-        factual  = float(data.get("factual",  0.5))
-        specific = float(data.get("specific", 0.5))
-        credible = float(data.get("credible", 0.5))
-        reason   = data.get("reason", "")
+        factual     = float(data.get("factual",     0.5))
+        specific    = float(data.get("specific",    0.5))
+        directional = float(data.get("directional", 0.5))
+        credible    = float(data.get("credible",    0.5))
+        reason      = data.get("reason", "")
 
-        # Weighted composite: factual and specific matter most
-        score = (factual * 0.4) + (specific * 0.4) + (credible * 0.2)
+        # Weighted composite: directional now carries as much weight as
+        # specificity — a real fact that doesn't argue for the estimate's
+        # direction should not pass on factual+specific alone.
+        score = (
+            factual * 0.25
+            + specific * 0.30
+            + directional * 0.30
+            + credible * 0.15
+        )
         passed = score >= PASS_THRESHOLD
 
         log.info(
             f"[Filter] score={score:.2f} factual={factual} "
-            f"specific={specific} credible={credible} "
+            f"specific={specific} directional={directional} credible={credible} "
             f"passed={passed} | {reason}"
         )
         return score, passed, reason

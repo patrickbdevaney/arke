@@ -1,39 +1,44 @@
 import { LiveIndicator } from "./components/LiveIndicator";
+import { TrackRecord } from "./components/TrackRecord";
+import type {
+    MarketIntelligence,
+    TrackRecordCall,
+    TrackRecordSummary,
+} from "./api/intelligence/route";
 
 export const revalidate = 60;
 
-type MarketIntelligence = {
-    conditionId: string;
-    question: string;
-    probabilityPct: number;
-    volume24hr: number;
-    volumeTotal: number;
-    endDateIso: string;
-    spread: number;
-    liquidityScore: "deep" | "moderate" | "thin";
-    betUrl: string;
-    arkeEstimatePct: number | null;
-    divergencePts: number | null;
-    arkePosition: "AGREE" | "DISAGREE" | "NEUTRAL" | null;
-    newsContext: string | null;
-    tweetUrl: string | null;
-    qualityScore: number | null;
-    postedAt: string | null;
+type IntelligenceResponse = {
+    markets: MarketIntelligence[];
+    trackRecord: TrackRecordSummary | null;
+    calls: TrackRecordCall[];
+    oracleContract: string | null;
 };
 
-async function getIntelligence(): Promise<MarketIntelligence[]> {
+async function getData(): Promise<IntelligenceResponse> {
     const host = process.env.VERCEL_URL
         ? `https://${process.env.VERCEL_URL}`
         : "http://localhost:3000";
+    const empty: IntelligenceResponse = {
+        markets: [],
+        trackRecord: null,
+        calls: [],
+        oracleContract: null,
+    };
     try {
         const r = await fetch(`${host}/api/intelligence`, {
             next: { revalidate: 60 }
         });
-        if (!r.ok) return [];
+        if (!r.ok) return empty;
         const data = await r.json();
-        return data.markets ?? [];
+        return {
+            markets: data.markets ?? [],
+            trackRecord: data.trackRecord ?? null,
+            calls: data.calls ?? [],
+            oracleContract: data.oracleContract ?? null,
+        };
     } catch {
-        return [];
+        return empty;
     }
 }
 
@@ -52,10 +57,10 @@ function LiquidityBadge({ score }: { score: string }) {
 
 function PositionBadge({ position }: { position: string | null }) {
     if (!position || position === "NEUTRAL") return null;
-    const isDisagree = position === "DISAGREE";
+    const isBearish = position === "DISAGREE" || position === "BEAR";
     return (
         <span className={`text-xs px-1 border font-bold ${
-            isDisagree
+            isBearish
                 ? "text-red-400 border-red-800 bg-red-950"
                 : "text-green-400 border-green-800 bg-green-950"
         }`}>
@@ -195,22 +200,27 @@ function StatsBar({ markets }: { markets: MarketIntelligence[] }) {
 }
 
 export default async function Page() {
-    const markets = await getIntelligence();
+    const { markets, trackRecord, calls, oracleContract } = await getData();
 
-    // Sort: Arke-analyzed and disagreements first, then by volume
+    // Sort: Arke-analyzed and divergent calls first, then by volume
     const sorted = [...markets].sort((a, b) => {
         const aHas = a.arkeEstimatePct !== null ? 1 : 0;
         const bHas = b.arkeEstimatePct !== null ? 1 : 0;
         if (aHas !== bHas) return bHas - aHas;
-        const aDisagree = a.arkePosition === "DISAGREE" ? 1 : 0;
-        const bDisagree = b.arkePosition === "DISAGREE" ? 1 : 0;
-        if (aDisagree !== bDisagree) return bDisagree - aDisagree;
+        const aDiverge = a.arkePosition === "DISAGREE" || a.arkePosition === "BEAR" ? 1 : 0;
+        const bDiverge = b.arkePosition === "DISAGREE" || b.arkePosition === "BEAR" ? 1 : 0;
+        if (aDiverge !== bDiverge) return bDiverge - aDiverge;
         return b.volume24hr - a.volume24hr;
     });
 
     return (
         <main className="bg-black min-h-screen">
             <StatsBar markets={markets} />
+            <TrackRecord
+                summary={trackRecord}
+                calls={calls}
+                oracleContract={oracleContract}
+            />
             <div className="px-4 py-4">
                 <div className="text-xs font-mono text-neutral-600 mb-4">
                     // {new Date().toISOString().slice(0, 19)}Z — live prediction market intelligence

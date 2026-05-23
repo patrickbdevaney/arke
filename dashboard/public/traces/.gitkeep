@@ -1,0 +1,5 @@
+# Arke provenance traces are written here at runtime:
+#   {condition_id[:16]}.json — the inputs + outputs that produced a call,
+#   sha256-hashed and stored in the DB as reasoning_cid (sha256:<hex>).
+# Generated JSON is gitignored; this file just keeps the directory tracked.
+# Roadmap: pin these to IPFS; the sha256 stays the verifiable content hash.

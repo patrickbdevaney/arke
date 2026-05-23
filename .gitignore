@@ -19,6 +19,7 @@ SECURITY_THREAT_MODEL.md
 
 *.pyc
 __pycache__/
+.pytest_cache/
 arke.db
 arke.db-wal
 arke.db-shm
@@ -29,3 +30,9 @@ node_modules/
 dist/
 .DS_Store
 *.log
+KICKOFF.MD
+
+# Generated provenance traces (the .gitkeep tracks the empty dir; sha256 in the
+# DB is the verifiable hash regardless of where the JSON is pinned)
+dashboard/public/traces/*
+!dashboard/public/traces/.gitkeep

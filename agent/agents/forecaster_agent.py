@@ -9,28 +9,50 @@ The probability estimate is the core product signal.
 
 import os
 import re
+import hashlib
 import logging
+from datetime import datetime, timezone
 from groq import Groq
 
 log = logging.getLogger(__name__)
 MODEL = "openai/gpt-oss-120b"
 
 
+def _extract_citations(text: str) -> list:
+    """Pull inline https?:// URLs out of the tweet as citations. The Bet: line
+    (scheme-less polymarket.com/...) is intentionally not matched."""
+    now = datetime.now(timezone.utc).isoformat()
+    seen, cites = set(), []
+    for raw in re.findall(r"https?://\S+", text or ""):
+        url = raw.rstrip(").,;'\"")
+        if url in seen:
+            continue
+        seen.add(url)
+        cites.append({
+            "claim": "",
+            "source_url": url,
+            "retrieved_at": now,
+            "content_sha256": hashlib.sha256(url.encode("utf-8")).hexdigest(),
+        })
+    return cites
+
+
 def run_forecaster_agent(
     market: dict,
     signal_report: str,
     market_url: str,
-) -> tuple[str, int]:
+) -> tuple[str, int, list]:
     """
     Generate analytical tweet with specific probability estimate.
 
     Returns:
-        (tweet_text, arke_probability_pct)
+        (tweet_text, arke_probability_pct, citations)
         arke_probability_pct: Arke's estimate (may differ from market)
+        citations: inline URLs cited in the tweet (provenance)
     """
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
-        return "", 0
+        return "", 0, []
 
     question = market.get("question", "")
     market_pct = int(float(market.get("lastTradePrice", 0)) * 100)
@@ -62,10 +84,24 @@ Line 2: "Arke estimates [X]% — " followed by one specific cited reason.
          once since 2015, reopening within 48h after ICAO pressure in March 2020."
 Line 3: "Bet: {market_url}"
 
+EVIDENCE MUST BE DIRECTIONAL (your tweet is rejected otherwise):
+GOOD — base rate that directly implies the estimate:
+  "Arke estimates 12% — incumbent senators have lost re-election in only 6 of
+   the last 84 contested races since 2018 (≈7%)."
+BAD — real named event that argues for no specific number (non-sequitur):
+  "Arke estimates 70% — the 2015 JCPOA shows diplomacy between these states is
+   possible." (The JCPOA is real but does not argue for 70% over 40% or 90%.)
+BAD — analogy to an unrelated historical event:
+  "Arke estimates 30% — like the 2008 financial crisis, markets can turn fast."
+  (2008 says nothing about THIS market's resolution.)
+
 RULES:
 - Under 260 characters total
 - Your estimate in line 2 must be a specific number
 - Cite verifiable facts only — no vague patterns
+- The cited fact must DIRECTLY imply your probability estimate direction —
+  not merely be related to the topic.
+- Never justify an estimate with an analogy to an unrelated historical event.
 - No hashtags, emojis, exclamation marks
 - Return ONLY the tweet text plus your estimate in this format:
   TWEET:
@@ -105,8 +141,8 @@ RULES:
                     arke_pct = max(0, min(100, int(nums[0])))
 
         log.info(f"[Forecaster] Market={market_pct}% Arke={arke_pct}% Edge={arke_pct-market_pct:+d}pts")
-        return tweet, arke_pct
+        return tweet, arke_pct, _extract_citations(tweet)
 
     except Exception as e:
         log.error(f"[Forecaster] Failed: {e}")
-        return "", 0
+        return "", 0, []

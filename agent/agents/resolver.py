@@ -146,6 +146,17 @@ async def check_resolutions() -> dict:
                 f"| {row.get('question', '')[:60]}"
             )
 
+            # Write the resolution onchain so the Brier ledger updates. Fails
+            # silently — a chain error must never abort the resolver loop.
+            try:
+                from agent.integrations.oracle import resolve_prediction_onchain
+                tx = resolve_prediction_onchain(cid, outcome == "YES")
+                if tx:
+                    logger.info(f"[Resolver] onchain resolution {cid[:12]} -> {tx[:20]}")
+                    db.record_oracle_resolution_tx(cid, tx)
+            except Exception as e:
+                logger.warning(f"[Resolver] onchain resolve failed (continuing): {e}")
+
     return {
         "markets_checked": len(unresolved),
         "markets_resolved": resolved_count,

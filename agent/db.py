@@ -188,6 +188,22 @@ class ArkeDB:
 
                 CREATE INDEX IF NOT EXISTS idx_runs_outcome
                     ON agent_runs(outcome);
+
+                -- --------------------------------------------------------
+                -- Symbolic stakes: real Polymarket positions placed as a
+                -- cryptographic commitment behind a call (Phase 4).
+                -- --------------------------------------------------------
+                CREATE TABLE IF NOT EXISTS stakes (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    condition_id    TEXT NOT NULL,
+                    side            TEXT NOT NULL,
+                    size_usdc       REAL NOT NULL,
+                    order_hash      TEXT,
+                    stake_tx        TEXT,
+                    staked_at       TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_stakes_condition
+                    ON stakes(condition_id);
             """)
 
             # Migration-safe: add new columns to existing deployments
@@ -217,6 +233,12 @@ class ArkeDB:
             ("posted_markets", "arke_probability_pct", "INTEGER"),
             ("posted_markets", "news_context", "TEXT NOT NULL DEFAULT ''"),
             ("posted_markets", "divergence_pts", "INTEGER"),
+            # V2 onchain accuracy + provenance layer
+            ("posted_markets", "oracle_log_tx", "TEXT"),
+            ("posted_markets", "oracle_resolve_tx", "TEXT"),
+            ("posted_markets", "stake_tx", "TEXT"),
+            ("posted_markets", "arke_call_yes", "INTEGER"),
+            ("posted_markets", "reasoning_cid", "TEXT"),
         ]
         existing = {}
         for table, col, typedef in migrations:
@@ -528,6 +550,68 @@ class ArkeDB:
                 ),
             )
 
+    # ------------------------------------------------------------------ #
+    # Onchain + provenance tx records                                      #
+    # ------------------------------------------------------------------ #
+
+    def record_oracle_log_tx(self, condition_id: str, tx: str):
+        """Persist the oracle logPrediction tx hash for a market."""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE posted_markets SET oracle_log_tx = ? WHERE condition_id = ?",
+                (tx, condition_id),
+            )
+
+    def record_oracle_resolution_tx(self, condition_id: str, tx: str):
+        """Persist the oracle resolvePrediction tx hash for a market."""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE posted_markets SET oracle_resolve_tx = ? WHERE condition_id = ?",
+                (tx, condition_id),
+            )
+
+    def record_stake_tx(self, condition_id: str, tx: str):
+        """Persist the Polymarket symbolic-stake order hash for a market."""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE posted_markets SET stake_tx = ? WHERE condition_id = ?",
+                (tx, condition_id),
+            )
+
+    def set_reasoning_cid(self, condition_id: str, cid: str):
+        """Persist the provenance bundle CID (sha256:... or ipfs CID)."""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE posted_markets SET reasoning_cid = ? WHERE condition_id = ?",
+                (cid, condition_id),
+            )
+
+    def record_stake(
+        self,
+        condition_id: str,
+        side: str,
+        size_usdc: float,
+        order_hash: str = None,
+        stake_tx: str = None,
+    ):
+        """Insert a row into the stakes ledger. Drives the lifetime cap."""
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO stakes
+                    (condition_id, side, size_usdc, order_hash, stake_tx, staked_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (condition_id, side, float(size_usdc), order_hash, stake_tx,
+                 self._now_iso()),
+            )
+
+    def get_total_staked_usdc(self) -> float:
+        """Sum of all symbolic stakes placed, in USDC. Drives the lifetime cap."""
+        with self._conn() as conn:
+            row = conn.execute("SELECT SUM(size_usdc) FROM stakes").fetchone()
+        return float(row[0]) if row and row[0] is not None else 0.0
+
     def get_unresolved_past_enddate(self) -> list[dict]:
         """Markets past end date that haven't been marked resolved yet.
         Used by the resolution checker to find markets to close out.
@@ -562,6 +646,99 @@ class ArkeDB:
                 (limit,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_track_record(self, limit: int = 200) -> list[dict]:
+        """Return all calls (resolved + open), newest first.
+
+        Fields: condition_id, question, arke_probability_pct, probability_pct,
+        divergence_bps, arke_call_yes, resolved, resolution, was_correct,
+        oracle_log_tx, oracle_resolve_tx, stake_tx, x_post_url, posted_at,
+        reasoning_cid.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT condition_id, question, arke_probability_pct,
+                       probability_pct, arke_call_yes, resolved, resolution,
+                       was_correct, oracle_log_tx, oracle_resolve_tx, stake_tx,
+                       x_post_url, posted_at, reasoning_cid
+                FROM posted_markets
+                ORDER BY posted_at_ts DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+        out = []
+        for r in rows:
+            d = dict(r)
+            arke = d.get("arke_probability_pct")
+            mkt = d.get("probability_pct")
+            # divergence_bps = (arke - market) * 100
+            d["divergence_bps"] = (
+                (int(arke) - int(mkt)) * 100
+                if arke is not None and mkt is not None else None
+            )
+            # Backward compat: derive the directional call if column is null
+            if d.get("arke_call_yes") is None and arke is not None:
+                d["arke_call_yes"] = 1 if int(arke) > 50 else 0
+            out.append(d)
+        return out
+
+    def get_accuracy_summary(self) -> dict:
+        """Returns n_total, n_resolved, n_correct, accuracy_pct (0–100),
+        brier_numerator_x10000, brier_index. Computed from SQLite.
+        Label source as 'sqlite' so callers know this is local not chain."""
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*)                                          AS n_total,
+                    SUM(CASE WHEN resolved = 1 THEN 1 ELSE 0 END)     AS n_resolved,
+                    SUM(CASE WHEN was_correct = 1 THEN 1 ELSE 0 END)  AS n_correct
+                FROM posted_markets
+                """
+            ).fetchone()
+            resolved_rows = conn.execute(
+                """
+                SELECT arke_probability_pct, probability_pct, resolution
+                FROM posted_markets
+                WHERE resolved = 1 AND resolution IN ('YES', 'NO')
+                """
+            ).fetchall()
+
+        n_total = row["n_total"] or 0
+        n_resolved = row["n_resolved"] or 0
+        n_correct = row["n_correct"] or 0
+        accuracy_pct = round(100.0 * n_correct / n_resolved, 1) if n_resolved else 0.0
+
+        # Brier = mean over resolved calls of (P(YES) - outcome)^2, scaled x10000.
+        # Lower is better; 0 = perfect, 2500 = always 50%, 10000 = max wrong.
+        brier_numerator_x10000 = 0
+        scored = 0
+        for r in resolved_rows:
+            arke = r["arke_probability_pct"]
+            if arke is None:
+                arke = r["probability_pct"]
+            if arke is None:
+                continue
+            forecast = max(0, min(100, int(arke))) / 100.0  # P(YES)
+            outcome = 1.0 if r["resolution"] == "YES" else 0.0
+            err = forecast - outcome
+            brier_numerator_x10000 += int(round(err * err * 10000))
+            scored += 1
+
+        brier_index = int(round(brier_numerator_x10000 / scored)) if scored else 0
+
+        return {
+            "n_total": n_total,
+            "n_resolved": n_resolved,
+            "n_correct": n_correct,
+            "accuracy_pct": accuracy_pct,
+            "brier_numerator_x10000": brier_numerator_x10000,
+            "brier_index": brier_index,
+            "source": "sqlite",
+        }
 
     def get_accuracy_stats(self) -> dict:
         """Arke's accuracy track record. Core dashboard metric."""

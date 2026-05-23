@@ -30,7 +30,7 @@ def compile_and_deploy():
 
     install_solc("0.8.19")
 
-    rpc_url = os.getenv("ARC_RPC_URL", "https://rpc.arc-testnet.canteen.xyz")
+    rpc_url = os.getenv("ARC_RPC_URL", "https://rpc.testnet.arc.network")
     private_key = os.getenv("ARC_PRIVATE_KEY", "")
     agent_address = os.getenv("CIRCLE_WALLET_ADDRESS", "")
 
@@ -78,13 +78,14 @@ def compile_and_deploy():
     })
 
     signed = account.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+    # web3 6.x renamed SignedTransaction.rawTransaction -> raw_transaction
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     print(f"Deploying... tx: {tx_hash.hex()}")
 
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
     contract_address = receipt["contractAddress"]
     print(f"\nOracle deployed at: {contract_address}")
-    print(f"Arc explorer: https://explorer.arc-testnet.canteen.xyz/address/{contract_address}")
+    print(f"Arc explorer: https://testnet.arcscan.app/address/{contract_address}")
 
     # Save ABI and address
     os.makedirs("deploy", exist_ok=True)

@@ -148,6 +148,28 @@ def infer_arke_probability(tweet_text: str, market_pct: int) -> int:
     return market_pct
 
 
+def _resolve_token_and_side(market: dict, arke_pct: int) -> tuple[str, str]:
+    """Resolve the CLOB token_id and side matching Arke's directional call.
+
+    side = YES when Arke leans >50%, else NO. token_id is the Polymarket
+    clobTokenId for that outcome ([0]=YES, [1]=NO). Returns ('', side) when
+    the market carries no token ids.
+    """
+    side = "YES" if arke_pct > 50 else "NO"
+    raw = market.get("clobTokenIds")
+    tokens = raw
+    if isinstance(raw, str):
+        import json as _json
+        try:
+            tokens = _json.loads(raw)
+        except Exception:
+            tokens = []
+    token_id = ""
+    if isinstance(tokens, list) and len(tokens) >= 2:
+        token_id = tokens[0] if side == "YES" else tokens[1]
+    return token_id, side
+
+
 # ------------------------------------------------------------------ #
 # Feed                                                                 #
 # ------------------------------------------------------------------ #
@@ -429,6 +451,7 @@ async def main(post: bool | None = None):
     print("\n[2.5/4] Signal Agent — aggregating context...")
     news_context = ""
     signal_report = ""
+    signal_citations = []
     try:
         from agent.integrations.signals import fetch_headlines
         from agent.agents.signal_agent import run_signal_agent
@@ -441,13 +464,13 @@ async def main(post: bool | None = None):
                          "with", "from", "they", "their", "been", "than", "into"}
             q_words = [w for w in question_lower.split()
                        if len(w) > 4 and w not in STOPWORDS]
-            matched = [h.get("title", "") for h in headlines
+            matched = [h for h in headlines
                        if any(w in h.get("title", "").lower() for w in q_words)]
 
             print(f"      {len(headlines)} headlines fetched, {len(matched)} matched")
             if matched:
-                news_context = " | ".join(matched[:4])
-                signal_report = run_signal_agent(market, matched[:8])
+                news_context = " | ".join(h.get("title", "") for h in matched[:4])
+                signal_report, signal_citations = run_signal_agent(market, matched[:8])
                 if signal_report:
                     print(f"      Signal report: {signal_report[:100]}...")
             else:
@@ -461,10 +484,11 @@ async def main(post: bool | None = None):
 
     tweet = ""
     arke_pct = int(float(market.get("lastTradePrice", 0)) * 100)
+    forecaster_citations = []
 
     for attempt in range(3):
         try:
-            tweet, arke_pct = run_forecaster_agent(market, signal_report, market_url)
+            tweet, arke_pct, forecaster_citations = run_forecaster_agent(market, signal_report, market_url)
             if tweet and len(tweet) > 20:
                 break
             print(f"      Attempt {attempt+1}: empty response — retrying")
@@ -515,7 +539,7 @@ async def main(post: bool | None = None):
             print(f"      Retrying forecaster with enriched prompt...")
             # Force another forecaster attempt with the rejection reason
             enriched_signal = (signal_report or "") + f"\n\nPREVIOUS ATTEMPT REJECTED: {filter_reason}\nMust cite a more specific verifiable fact."
-            tweet, arke_pct = run_forecaster_agent(market, enriched_signal, market_url)
+            tweet, arke_pct, forecaster_citations = run_forecaster_agent(market, enriched_signal, market_url)
 
     # Recompute edge/position in case a retry changed Arke's estimate
     edge = arke_pct - market_pct
@@ -529,6 +553,29 @@ async def main(post: bool | None = None):
                 error_message=f"quality_blocked: {filter_reason}")
         print("\nDone.")
         return
+
+    # ── Provenance bundle (sha256-pinned reasoning trace) ──────────
+    # Written in both dry-run and live modes; the DB cid is set only on a live
+    # post (when a posted_markets row exists).
+    citations = (signal_citations or []) + (forecaster_citations or [])
+    reasoning_cid = ""
+    try:
+        from agent.provenance import assemble_bundle, write_trace
+        bundle, _bundle_json, bundle_sha = assemble_bundle(
+            condition_id=cid,
+            arke_pct=arke_pct,
+            market_pct=market_pct,
+            question=market.get("question"),
+            council_signal=signal_report,
+            council_forecast=tweet,
+            citations=citations,
+        )
+        trace_path = write_trace(bundle, cid)
+        reasoning_cid = f"sha256:{bundle_sha}"
+        print(f"      Provenance bundle written to {trace_path}")
+        print(f"      reasoning_cid: {reasoning_cid}")
+    except Exception as e:
+        print(f"      Provenance bundle skipped: {e}")
 
     # ── 4. Post or dry run ─────────────────────────────────────────
     print("\n[4/4] Posting to X...")
@@ -586,6 +633,8 @@ async def main(post: bool | None = None):
                 duration_ms=duration_ms,
             )
             print(f"      DB row: {row_id}")
+            if reasoning_cid:
+                db.set_reasoning_cid(cid, reasoning_cid)
 
         # ── Onchain oracle log ──────────────────────────────────────
         try:
@@ -598,10 +647,30 @@ async def main(post: bool | None = None):
             )
             if tx_hash:
                 print(f"      Oracle: {tx_hash[:20]}...")
+                if tx_hash and DB_AVAILABLE:
+                    db.record_oracle_log_tx(cid, tx_hash)
             else:
                 print(f"      Oracle: skipped (no key or contract)")
         except Exception as e:
             print(f"      Oracle: failed silently ({e})")
+
+        # ── Symbolic stake (commitment device) — OFF unless ENABLE_STAKE=1 ──
+        # Never set ENABLE_STAKE=1 on the VPS; only locally for the demo runs.
+        if os.getenv("ENABLE_STAKE") == "1" and not dry_run:
+            try:
+                from agent.integrations.polymarket_stake import place_symbolic_stake
+                token_id, side = _resolve_token_and_side(market, arke_pct)
+                stx = place_symbolic_stake(
+                    cid, token_id, side,
+                    float(os.getenv("STAKE_MAX_USDC", "0.5")),
+                    os.getenv("POLY_BUILDER_CODE", ""),
+                )
+                if stx:
+                    print(f"      Stake: {stx[:20]}")
+                    if DB_AVAILABLE:
+                        db.record_stake_tx(cid, stx)
+            except Exception as e:
+                print(f"      Stake skipped: {e}")
 
         print(f"\n      Check @arke_ai on X")
 

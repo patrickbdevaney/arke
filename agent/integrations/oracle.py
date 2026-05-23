@@ -20,7 +20,7 @@ def _get_web3_and_contract():
     except ImportError:
         return None, None
 
-    rpc_url = os.getenv("ARC_RPC_URL", "https://rpc.arc-testnet.canteen.xyz")
+    rpc_url = os.getenv("ARC_RPC_URL", "https://rpc.testnet.arc.network")
     contract_address = os.getenv("ORACLE_CONTRACT_ADDRESS", "")
 
     if not contract_address:
@@ -46,6 +46,27 @@ def _get_web3_and_contract():
     return w3, contract
 
 
+def _condition_id_to_bytes32(condition_id: str) -> bytes:
+    """Pad/truncate a Polymarket condition_id to a 32-byte value.
+
+    This MUST be identical for logPrediction and resolvePrediction — both key
+    the contract's `predictions` mapping by this bytes32, so a resolution only
+    hits the right slot if it hashes the condition_id exactly as the log did.
+    """
+    cid = condition_id[:66] if condition_id.startswith("0x") else f"0x{condition_id}"
+    cid_padded = cid.ljust(66, "0")[:66]
+    return bytes.fromhex(cid_padded[2:])
+
+
+def _gas_price(w3) -> int:
+    """Arc charges gas in USDC; some nodes report gas_price 0, and a 0-price tx
+    reverts silently. Floor it at 1_000_000 wei-equivalent."""
+    try:
+        return w3.eth.gas_price or 1_000_000
+    except Exception:
+        return 1_000_000
+
+
 def log_prediction_onchain(
     condition_id: str,
     question: str,
@@ -69,11 +90,7 @@ def log_prediction_onchain(
             return ""
 
         account = w3.eth.account.from_key(private_key)
-
-        # Convert condition_id to bytes32
-        cid = condition_id[:66] if condition_id.startswith("0x") else f"0x{condition_id}"
-        cid_padded = cid.ljust(66, "0")[:66]
-        cid_bytes = bytes.fromhex(cid_padded[2:])
+        cid_bytes = _condition_id_to_bytes32(condition_id)
 
         tx = contract.functions.logPrediction(
             cid_bytes,
@@ -84,15 +101,53 @@ def log_prediction_onchain(
             "from": account.address,
             "nonce": w3.eth.get_transaction_count(account.address),
             "gas": 200_000,
-            "gasPrice": w3.eth.gas_price,
+            "gasPrice": _gas_price(w3),
         })
 
         signed = account.sign_transaction(tx)
-        tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+        # web3 6.x renamed SignedTransaction.rawTransaction -> raw_transaction
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
         tx_hex = tx_hash.hex()
         log.info(f"[Oracle] Logged onchain: {tx_hex}")
         return tx_hex
 
     except Exception as e:
         log.warning(f"[Oracle] Failed to log onchain: {e} — continuing")
+        return ""
+
+
+def resolve_prediction_onchain(condition_id: str, outcome_yes: bool) -> str:
+    """Call resolvePrediction(conditionId, outcome) on the oracle.
+    Returns tx hash or ''. Fails silently — never blocks the resolver."""
+    private_key = os.getenv("ARC_PRIVATE_KEY", "")
+    if not private_key:
+        log.debug("[Oracle] ARC_PRIVATE_KEY not set — skipping onchain resolve")
+        return ""
+
+    try:
+        w3, contract = _get_web3_and_contract()
+        if not w3 or not contract:
+            return ""
+
+        account = w3.eth.account.from_key(private_key)
+        cid_bytes = _condition_id_to_bytes32(condition_id)
+
+        tx = contract.functions.resolvePrediction(
+            cid_bytes,
+            bool(outcome_yes),
+        ).build_transaction({
+            "from": account.address,
+            "nonce": w3.eth.get_transaction_count(account.address),
+            "gas": 150_000,
+            "gasPrice": _gas_price(w3),
+        })
+
+        signed = account.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        tx_hex = tx_hash.hex()
+        log.info(f"[Oracle] Resolved onchain: {tx_hex}")
+        return tx_hex
+
+    except Exception as e:
+        log.warning(f"[Oracle] Failed to resolve onchain: {e} — continuing")
         return ""

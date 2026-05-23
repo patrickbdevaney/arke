@@ -6,28 +6,60 @@ Produces structured signal report for the Forecaster.
 """
 
 import os
+import hashlib
 import logging
+from datetime import datetime, timezone
 from groq import Groq
 
 log = logging.getLogger(__name__)
 MODEL = "llama-3.3-70b-versatile"
 
 
-def run_signal_agent(market: dict, headlines: list[str]) -> str:
+def _h_title(h) -> str:
+    return h if isinstance(h, str) else (h.get("title", "") or "")
+
+
+def _h_url(h) -> str:
+    return "" if isinstance(h, str) else (h.get("url", "") or "")
+
+
+def _build_citations(headlines: list) -> list:
+    """One citation per used headline: claim=title, source_url (or ''), and the
+    sha256 of the title text for tamper-evidence."""
+    now = datetime.now(timezone.utc).isoformat()
+    cites = []
+    for h in headlines[:8]:
+        title = _h_title(h)
+        if not title:
+            continue
+        cites.append({
+            "claim": title,
+            "source_url": _h_url(h),
+            "retrieved_at": now,
+            "content_sha256": hashlib.sha256(title.encode("utf-8")).hexdigest(),
+        })
+    return cites
+
+
+def run_signal_agent(market: dict, headlines: list) -> tuple[str, list]:
     """
-    Aggregate signals for a market. Returns structured report string.
-    Falls back to empty string on failure (pipeline continues without context).
+    Aggregate signals for a market. Returns (report, citations).
+    `headlines` items may be plain title strings or {title,url,source} dicts.
+    Falls back to ("", citations) on LLM failure (pipeline continues without
+    a report but keeps the citations it already retrieved).
     """
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key or not headlines:
-        return ""
+        return "", []
+
+    citations = _build_citations(headlines)
 
     question = market.get("question", "")
     pct = int(float(market.get("lastTradePrice", 0)) * 100)
     vol = float(market.get("volume24hr", 0))
     end = market.get("endDateIso", "")
 
-    headline_block = "\n".join(f"- {h}" for h in headlines[:8])
+    headline_block = "\n".join(f"- {_h_title(h)}" for h in headlines[:8])
 
     prompt = f"""You are a signal aggregation agent for prediction markets.
 
@@ -56,8 +88,11 @@ Keep the entire report under 200 words. Be specific. Cite years and numbers."""
             max_tokens=300,
         )
         report = (response.choices[0].message.content or "").strip()
-        log.info(f"[SignalAgent] Report generated ({len(report)} chars)")
-        return report
+        log.info(
+            f"[SignalAgent] Report generated ({len(report)} chars), "
+            f"{len(citations)} citations"
+        )
+        return report, citations
     except Exception as e:
         log.warning(f"[SignalAgent] Failed: {e} — continuing without signal report")
-        return ""
+        return "", citations

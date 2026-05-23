@@ -1,0 +1,18 @@
+[Unit]
+Description=Arke feed server (x402 paid intelligence endpoint)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=arke
+WorkingDirectory=/opt/arke
+ExecStart=/opt/arke/venv/bin/uvicorn agent.feed_server:app --host 0.0.0.0 --port 8402
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+EnvironmentFile=/opt/arke/.env
+
+[Install]
+WantedBy=multi-user.target

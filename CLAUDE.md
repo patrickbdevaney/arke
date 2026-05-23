@@ -47,17 +47,40 @@ a `.local.md`.
   Runs the loop on startup + every 6h; resolver every 24h. systemd `Restart=always`.
 - **Council** (all Groq; separate model IDs = separate rate-limit buckets):
   - `agent/agents/signal_agent.py` — `llama-3.3-70b-versatile`, aggregates headlines.
+    Returns `(report, citations)` — citations feed the provenance bundle.
   - `agent/agents/forecaster_agent.py` — `openai/gpt-oss-120b`, emits a calibrated
-    Arke probability + tweet (`Arke estimates X%`).
+    Arke probability + tweet (`Arke estimates X%`). Returns `(tweet, arke_pct, citations)`.
   - `agent/agents/adversary_agent.py` — `qwen/qwen3-32b`, fact-checks / rewrites once.
   - `agent/agents/filter.py` — `openai/gpt-oss-120b` quality gate, threshold 0.65,
-    **fails open** on API error.
+    **fails open** on API error. Scores `factual/specific/directional/credible`;
+    `directional` catches real-but-non-sequitur evidence.
 - **Posting:** `agent/integrations/opentweet.py` → direct X API v2 via tweepy
   (OAuth 1.0a, no expiry). Consumer creds resolve `X_API_KEY`/`X_API_SECRET`, then
   fall back to this `.env`'s actual names `X_API_CONSUMER_KEY`/`X_API_SECRET_KEY`.
-- **Oracle (dormant):** `agent/integrations/oracle.py` + `contracts/` + `deploy/`.
-  Logs predictions onchain only when `ARC_PRIVATE_KEY` + `ORACLE_CONTRACT_ADDRESS`
-  are set; otherwise skips silently. Never blocks posting.
+- **Oracle (live when configured):** `agent/integrations/oracle.py` +
+  `contracts/PredictionMarketOracle.sol` + `deploy/`. `log_prediction_onchain`
+  writes each call; `resolve_prediction_onchain` writes each resolution (called by
+  the resolver). Active only when `ARC_PRIVATE_KEY` + `ORACLE_CONTRACT_ADDRESS` are
+  set; otherwise skips silently. Never blocks posting/resolving. Arc testnet RPC
+  `rpc.testnet.arc.network`, chainId 5042002, explorer `testnet.arcscan.app`.
+  `scripts/backfill_oracle.py` replays history onchain (idempotent).
+- **Resolver:** `agent/agents/resolver.py` — daily; scores `was_correct` from
+  `arke_probability_pct` (position only for legacy rows) and writes the resolution
+  onchain.
+- **x402 feed:** `agent/feed_server.py` (FastAPI, `infra/arke-feed.service`, port
+  8402). Free `/healthz` + `/v1/arke/preview/{cid}`; x402-gated
+  `/v1/arke/calls/{cid}` ($0.001) and `/v1/arke/track-record` ($0.01). Fails open
+  when `X402_RECEIVE_ADDRESS` unset (dev); `X-Internal` + `INTERNAL_SECRET` bypass
+  lets the dashboard read it server-side without paying.
+- **Symbolic stake:** `agent/integrations/polymarket_stake.py` — places a tiny real
+  Polymarket position as a commitment. **OFF unless `ENABLE_STAKE=1`** (local-only,
+  never on the VPS). Hard caps `STAKE_MAX_USDC` / `STAKE_LIFETIME_CAP_USDC`.
+- **Provenance:** `agent/provenance.py` — sha256-pinned reasoning bundle written to
+  `dashboard/public/traces/{cid[:16]}.json`; hash stored as `reasoning_cid`.
+- **ERC-8004:** `scripts/register_erc8004.py` + `dashboard/public/.well-known/
+  agent-registration.json` — mints an agent identity NFT on Arc testnet.
+- **Dashboard:** `dashboard/` (Next.js 14 on Vercel) renders the track record,
+  Brier/accuracy chart, and per-call verify panel from the feed (`ARKE_FEED_URL`).
 
 ## Gotchas
 
