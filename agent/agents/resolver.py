@@ -47,6 +47,36 @@ def _parse_outcome(market_data: dict) -> str | None:
     return None
 
 
+def _arke_call(post: dict) -> str | None:
+    """Reduce a stored post to Arke's directional call: 'YES', 'NO', or None.
+
+    Council-era rows carry arke_probability_pct (Arke's own estimate), which is
+    the most direct signal: >50 means Arke leaned YES. Position labels
+    (AGREE/BULL/BEAR) are relative to the market, so they can't be scored
+    directly — e.g. BULL on a 20%->35% market is still a NO call. We use them
+    only as a fallback for legacy rows that predate arke_probability_pct.
+    """
+    arke_pct = post.get("arke_probability_pct")
+    if arke_pct is not None:
+        try:
+            return "YES" if int(arke_pct) > 50 else "NO"
+        except (TypeError, ValueError):
+            pass
+
+    # Legacy fallback: derive direction from the position label vs the market.
+    pos = (post.get("arke_position") or "NEUTRAL").upper()
+    market_pct = int(post.get("probability_pct") or 0)
+    if pos in ("AGREE", "NEUTRAL"):
+        return "YES" if market_pct > 50 else "NO"
+    if pos == "DISAGREE":
+        return "NO" if market_pct > 50 else "YES"
+    if pos == "BULL":
+        return "YES"
+    if pos == "BEAR":
+        return "NO"
+    return None
+
+
 async def _fetch_market(client: httpx.AsyncClient, condition_id: str) -> dict | None:
     try:
         r = await client.get(GAMMA_URL, params={"condition_ids": condition_id})
@@ -91,7 +121,7 @@ async def check_resolutions() -> dict:
                         dict(r)
                         for r in conn.execute(
                             """
-                            SELECT arke_position, probability_pct
+                            SELECT arke_position, probability_pct, arke_probability_pct
                             FROM posted_markets
                             WHERE condition_id = ? AND resolved = 0
                             """,
@@ -104,18 +134,8 @@ async def check_resolutions() -> dict:
 
             was_correct = False
             for p in posts:
-                pos = (p.get("arke_position") or "NEUTRAL").upper()
-                pct = int(p.get("probability_pct") or 0)
-                if pos == "AGREE" and pct > 50 and outcome == "YES":
-                    was_correct = True
-                    break
-                if pos == "AGREE" and pct <= 50 and outcome == "NO":
-                    was_correct = True
-                    break
-                if pos == "DISAGREE" and pct > 50 and outcome == "NO":
-                    was_correct = True
-                    break
-                if pos == "DISAGREE" and pct <= 50 and outcome == "YES":
+                predicted = _arke_call(p)
+                if predicted is not None and predicted == outcome:
                     was_correct = True
                     break
 
