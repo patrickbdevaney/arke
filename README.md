@@ -52,7 +52,7 @@ generated for each call so the basis of every estimate is reconstructible.
 | Paid feed | `http://feed.arke.live:8402` — x402: `$0.001`/call, `$0.01`/track-record |
 | x402 payment recipient | `0x35a894fd32f05F5B7f00D8940718f7aDb4D2D8fE` |
 | Builder address | `0x310072d29a53aa0650e09628005a4704e9c4b0d0` |
-| ERC-8004 agent identity | _pending registry deployment_ |
+| ERC-8004 agent identity | Agent ID `20360` · registry `0x8004A818BFB912233c491871b3d84c89A494BD9e` · mint tx `0xef3c487260357830d1f0f12e96786443337b7f7d52e5f86d02ba248ed0a38531` |
 | Sample stake tx | _pending_ |
 | Sample x402 receipt | _pending_ |
 

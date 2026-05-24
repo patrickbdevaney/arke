@@ -24,7 +24,7 @@ AGENT_FILE = Path(__file__).resolve().parent.parent / "deploy" / "erc8004_agent.
 REGISTRY_ABI = [
     {
         "inputs": [{"internalType": "string", "name": "tokenURI", "type": "string"}],
-        "name": "registerAgent",
+        "name": "register",
         "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
         "stateMutability": "nonpayable",
         "type": "function",
@@ -73,26 +73,33 @@ def register(registry_address: str) -> tuple[int, str]:
         abi=REGISTRY_ABI,
     )
 
+    fn = contract.functions.register(TOKEN_URI)
+
     # Best-effort: simulate the call to read the returned agent id.
     agent_id = 0
     try:
-        agent_id = int(
-            contract.functions.registerAgent(TOKEN_URI).call({"from": account.address})
-        )
+        agent_id = int(fn.call({"from": account.address}))
     except Exception:
         pass
 
-    tx = contract.functions.registerAgent(TOKEN_URI).build_transaction({
+    try:
+        gas = int(fn.estimate_gas({"from": account.address}) * 1.3)
+    except Exception:
+        gas = 500_000
+
+    tx = fn.build_transaction({
         "from": account.address,
         "nonce": w3.eth.get_transaction_count(account.address),
-        "gas": 500_000,
+        "gas": gas,
         "gasPrice": w3.eth.gas_price or 1_000_000,
     })
     signed = account.sign_transaction(tx)
     # eth-account 0.11 (web3 6.x) uses rawTransaction; 0.13+ uses raw_transaction
     raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
     tx_hash = w3.eth.send_raw_transaction(raw)
-    w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+    if receipt.status != 1:
+        raise RuntimeError(f"registration tx reverted onchain: {tx_hash.hex()}")
     return agent_id, tx_hash.hex()
 
 
