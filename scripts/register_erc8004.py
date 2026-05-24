@@ -61,7 +61,12 @@ def register(registry_address: str) -> tuple[int, str]:
     """Mint the Identity NFT. Returns (agent_id, tx_hash). Requires web3 + key."""
     from web3 import Web3
 
-    rpc = os.getenv("ARC_RPC_URL", "https://rpc.testnet.arc.network")
+    rpc = (
+        os.getenv("ARC_RPC_PRIMARY")
+        or os.getenv("ARC_RPC_FALLBACK")
+        or os.getenv("ARC_RPC_URL")
+        or "https://rpc.testnet.arc.network"
+    )
     key = os.getenv("ARC_PRIVATE_KEY", "")
     if not key:
         raise RuntimeError("ARC_PRIVATE_KEY not set")

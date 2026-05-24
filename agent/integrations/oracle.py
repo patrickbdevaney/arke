@@ -20,7 +20,12 @@ def _get_web3_and_contract():
     except ImportError:
         return None, None
 
-    rpc_url = os.getenv("ARC_RPC_URL", "https://rpc.testnet.arc.network")
+    rpc_url = (
+        os.getenv("ARC_RPC_PRIMARY")
+        or os.getenv("ARC_RPC_FALLBACK")
+        or os.getenv("ARC_RPC_URL")
+        or "https://rpc.testnet.arc.network"
+    )
     contract_address = os.getenv("ORACLE_CONTRACT_ADDRESS", "")
 
     if not contract_address:

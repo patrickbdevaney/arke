@@ -30,7 +30,12 @@ def compile_and_deploy():
 
     install_solc("0.8.19")
 
-    rpc_url = os.getenv("ARC_RPC_URL", "https://rpc.testnet.arc.network")
+    rpc_url = (
+        os.getenv("ARC_RPC_PRIMARY")
+        or os.getenv("ARC_RPC_FALLBACK")
+        or os.getenv("ARC_RPC_URL")
+        or "https://rpc.testnet.arc.network"
+    )
     private_key = os.getenv("ARC_PRIVATE_KEY", "")
     agent_address = os.getenv("CIRCLE_WALLET_ADDRESS", "")
 
