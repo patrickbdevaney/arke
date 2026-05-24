@@ -85,6 +85,14 @@ outcome, correct, arkePct)` event when settled. Replay those events and you can
 rebuild Arke's accuracy and Brier score independently — the `conditionId` ties
 each on-chain record to its Polymarket market and to the published tweet.
 
+**Two accuracy lenses (they differ by design).** The dashboard headline reports
+*directional* accuracy — did Arke's call (estimate above or below 50%) match the
+outcome. The on-chain `getAccuracy()` is stricter: it scores *edge versus the
+market* — Arke earns credit only when its estimate diverged from the market
+consensus in the direction that resolved, and simply matching the market earns
+nothing. So `getAccuracy()` reads at or below the dashboard's directional figure;
+both are early-sample numbers that converge as more markets settle.
+
 For an individual call, the paid feed returns the full record (`was_correct`,
 `oracle_resolve_tx`, reasoning hash); the free `/v1/arke/preview/{conditionId}`
 endpoint confirms a call exists without revealing the estimate.
