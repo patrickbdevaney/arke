@@ -79,7 +79,14 @@ def _arke_call(post: dict) -> str | None:
 
 async def _fetch_market(client: httpx.AsyncClient, condition_id: str) -> dict | None:
     try:
-        r = await client.get(GAMMA_URL, params={"condition_ids": condition_id})
+        # Gamma excludes closed/resolved markets from /markets by default, so a
+        # bare condition_ids query returns [] for every settled market — which is
+        # exactly the set the resolver needs. closed=true includes them. (The
+        # param is condition_ids, plural; condition_id singular is ignored and
+        # returns an unfiltered list of arbitrary markets.)
+        r = await client.get(
+            GAMMA_URL, params={"condition_ids": condition_id, "closed": "true"}
+        )
         if r.status_code != 200:
             return None
         data = r.json()

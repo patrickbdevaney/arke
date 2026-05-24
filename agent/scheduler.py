@@ -122,8 +122,13 @@ def main():
     print(banner, flush=True)
     logger.info("Scheduler started — next run at %s", next_run)
 
-    # Run once immediately on startup
+    # Run once immediately on startup. Also run the resolver on startup: the
+    # `schedule` library is in-memory, so every restart (deploy, reboot, crash)
+    # resets the 24h resolver timer. Without a startup run, frequent restarts
+    # would starve resolutions and the Brier ledger would never update. The
+    # resolver is idempotent — it only touches unresolved, past-end-date rows.
     run_loop()
+    run_resolver()
 
     while True:
         try:
