@@ -67,6 +67,45 @@ def _gas_price(w3) -> int:
         return 1_000_000
 
 
+def _estimate_gas(fn, account, fallback: int) -> int:
+    """Estimate gas for a contract call with a 30% buffer; fall back to a
+    generous fixed cap if estimation fails.
+
+    logPrediction stores a struct + string + array push (~237k–330k depending on
+    question length), well above the old hardcoded 200k that silently OOG-reverted.
+    """
+    try:
+        return int(fn.estimate_gas({"from": account.address}) * 1.3)
+    except Exception:
+        return fallback
+
+
+def _send_and_confirm(w3, account, fn, gas: int, label: str) -> str:
+    """Sign, send, and CONFIRM a state-changing call.
+
+    Returns the tx hash only if the receipt status is success (1). A submitted
+    tx that reverts onchain must never be recorded as logged — that would pin a
+    bogus hash into the track record the dashboard/paid feed serve as proof.
+    """
+    tx = fn.build_transaction({
+        "from": account.address,
+        "nonce": w3.eth.get_transaction_count(account.address),
+        "gas": gas,
+        "gasPrice": _gas_price(w3),
+    })
+    signed = account.sign_transaction(tx)
+    # eth-account 0.11 (web3 6.x) uses rawTransaction; 0.13+ uses raw_transaction
+    raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
+    tx_hash = w3.eth.send_raw_transaction(raw)
+    tx_hex = tx_hash.hex()
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+    if receipt.status != 1:
+        log.warning(f"[Oracle] {label} REVERTED onchain: {tx_hex} (status={receipt.status})")
+        return ""
+    log.info(f"[Oracle] {label}: {tx_hex}")
+    return tx_hex
+
+
 def log_prediction_onchain(
     condition_id: str,
     question: str,
@@ -92,25 +131,14 @@ def log_prediction_onchain(
         account = w3.eth.account.from_key(private_key)
         cid_bytes = _condition_id_to_bytes32(condition_id)
 
-        tx = contract.functions.logPrediction(
+        fn = contract.functions.logPrediction(
             cid_bytes,
             question[:200],  # cap length for gas
             min(100, max(0, market_pct)),
             min(100, max(0, arke_pct)),
-        ).build_transaction({
-            "from": account.address,
-            "nonce": w3.eth.get_transaction_count(account.address),
-            "gas": 200_000,
-            "gasPrice": _gas_price(w3),
-        })
-
-        signed = account.sign_transaction(tx)
-        # eth-account 0.11 (web3 6.x) uses rawTransaction; 0.13+ uses raw_transaction
-        raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
-        tx_hash = w3.eth.send_raw_transaction(raw)
-        tx_hex = tx_hash.hex()
-        log.info(f"[Oracle] Logged onchain: {tx_hex}")
-        return tx_hex
+        )
+        gas = _estimate_gas(fn, account, fallback=600_000)
+        return _send_and_confirm(w3, account, fn, gas, "Logged onchain")
 
     except Exception as e:
         log.warning(f"[Oracle] Failed to log onchain: {e} — continuing")
@@ -133,23 +161,12 @@ def resolve_prediction_onchain(condition_id: str, outcome_yes: bool) -> str:
         account = w3.eth.account.from_key(private_key)
         cid_bytes = _condition_id_to_bytes32(condition_id)
 
-        tx = contract.functions.resolvePrediction(
+        fn = contract.functions.resolvePrediction(
             cid_bytes,
             bool(outcome_yes),
-        ).build_transaction({
-            "from": account.address,
-            "nonce": w3.eth.get_transaction_count(account.address),
-            "gas": 150_000,
-            "gasPrice": _gas_price(w3),
-        })
-
-        signed = account.sign_transaction(tx)
-        # eth-account 0.11 (web3 6.x) uses rawTransaction; 0.13+ uses raw_transaction
-        raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
-        tx_hash = w3.eth.send_raw_transaction(raw)
-        tx_hex = tx_hash.hex()
-        log.info(f"[Oracle] Resolved onchain: {tx_hex}")
-        return tx_hex
+        )
+        gas = _estimate_gas(fn, account, fallback=400_000)
+        return _send_and_confirm(w3, account, fn, gas, "Resolved onchain")
 
     except Exception as e:
         log.warning(f"[Oracle] Failed to resolve onchain: {e} — continuing")

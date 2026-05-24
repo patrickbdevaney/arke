@@ -61,6 +61,11 @@ def _fake_web3():
     txh = MagicMock()
     txh.hex.return_value = "0xdeadbeef"
     w3.eth.send_raw_transaction.return_value = txh
+
+    # _send_and_confirm waits for the receipt and requires status == 1.
+    receipt = MagicMock()
+    receipt.status = 1
+    w3.eth.wait_for_transaction_receipt.return_value = receipt
     return w3
 
 
