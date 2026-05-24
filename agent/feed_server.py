@@ -217,12 +217,18 @@ def track_record(request: Request):
 
     db = _db()
     summary = db.get_accuracy_summary()
+    try:
+        brier_by_category = db.get_brier_by_category()
+    except Exception as e:
+        log.warning(f"[feed] brier_by_category failed: {e}")
+        brier_by_category = {}
     return {
         "summary": {
             "n_total": summary["n_total"],
             "n_resolved": summary["n_resolved"],
             "accuracy_pct": summary["accuracy_pct"],
             "brier_index": summary["brier_index"],
+            "brier_by_category": brier_by_category,
             "source": "sqlite",
             "oracle_contract": os.getenv("ORACLE_CONTRACT_ADDRESS") or None,
             "operating_since": OPERATING_SINCE,

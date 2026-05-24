@@ -148,3 +148,143 @@ RULES:
     except Exception as e:
         log.error(f"[Forecaster] Failed: {e}")
         return "", 0, []
+
+
+def run_forecaster_ensemble(
+    market: dict,
+    signal_report: str,
+    market_url: str,
+) -> tuple[str, int, list]:
+    """
+    Run three forecasters in parallel with different model + framing combos.
+    Aggregate via MEDIAN of the probability estimates (Schoenegger 2024).
+    Falls back to run_forecaster_agent() if fewer than 2 succeed.
+    """
+    import statistics
+
+    CONFIGS = [
+        # (model, framing_label, extra_instruction)
+        (
+            "openai/gpt-oss-120b",
+            "superforecaster",
+            "",   # existing prompt — no extra instruction
+        ),
+        (
+            "llama-3.3-70b-versatile",
+            "base-rate-first",
+            (
+                "Lead with the reference class and base rate from the BASE RATE "
+                "block (if present). If confidence is MEASURED, treat the "
+                "percentage as a reliable anchor and state it explicitly. "
+                "If confidence is ROUGH PRIOR, name the class but weight it "
+                "lightly and anchor instead on the live domain signal. "
+                "If it is a BASE RATE NOTE (redirect), ignore the number and "
+                "use the live signal block. Then adjust from the anchor with "
+                "the most specific evidence available."
+            ),
+        ),
+        (
+            "qwen/qwen3-32b",
+            "devil's-advocate",
+            (
+                "Argue AGAINST the market consensus. Identify the strongest "
+                "specific reason the market is wrong, then estimate what the "
+                "probability should be. If you genuinely cannot find a flaw, "
+                "you may confirm the market, but bias toward disagreement."
+            ),
+        ),
+    ]
+
+    successes: list[tuple[str, int, list]] = []
+
+    for model, label, extra in CONFIGS:
+        try:
+            api_key = os.getenv("GROQ_API_KEY")
+            if not api_key:
+                continue
+            client = Groq(api_key=api_key)
+            question   = market.get("question", "")
+            market_pct = int(float(market.get("lastTradePrice", 0)) * 100)
+            vol        = float(market.get("volume24hr", 0))
+            end        = market.get("endDateIso", "")
+            sig_block  = (f"\nSIGNAL REPORT:\n{signal_report}"
+                          if signal_report else "")
+            extra_block = (f"\n\nFRAMING INSTRUCTION:\n{extra}" if extra else "")
+
+            prompt = f"""You are Arke, an autonomous prediction market intelligence agent.
+You apply superforecasting methodology: reference class thinking, base rates,
+specific mechanisms. You produce calibrated probability estimates.
+
+Market: {question}
+Market consensus: {market_pct}% YES
+24hr volume: ${vol:,.0f}
+Resolves: {end}{sig_block}{extra_block}
+
+Your task:
+1. Assess whether the market consensus of {market_pct}% is correct
+2. Produce YOUR probability estimate
+3. Write a 3-line tweet
+
+TWEET FORMAT (follow exactly):
+Line 1: State the market and the market's probability as fact. One sentence.
+Line 2: "Arke estimates [X]% — " followed by one specific cited reason.
+         X is YOUR probability estimate. The reason MUST cite a specific
+         year, named event, or number.
+Line 3: "Bet: {market_url}"
+
+RULES:
+- Under 260 characters total
+- Your estimate in line 2 must be a specific number
+- Cite verifiable facts only
+- The cited fact must DIRECTLY imply your probability direction
+- No hashtags, emojis, exclamation marks
+- Return ONLY:
+  TWEET:
+  [tweet text]
+  ARKE_PCT: [your probability as integer 0-100]"""
+
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.5,
+                max_tokens=4096,
+            )
+            raw = (resp.choices[0].message.content or "").strip()
+            arke_pct = market_pct
+            mpct = re.search(r"ARKE_PCT:\s*(\d{1,3})", raw)
+            if mpct:
+                arke_pct = max(0, min(100, int(mpct.group(1))))
+            tweet = raw.split("TWEET:", 1)[1] if "TWEET:" in raw else raw
+            tweet = re.split(r"ARKE_PCT:", tweet)[0].strip()
+            if not mpct:
+                lines = tweet.split("\n")
+                if len(lines) >= 2:
+                    nums = re.findall(r"(\d{1,3})\s*%", lines[1])
+                    if nums:
+                        arke_pct = max(0, min(100, int(nums[0])))
+            log.info(f"[Ensemble:{label}] {model} → {arke_pct}%")
+            successes.append((tweet, arke_pct, _extract_citations(tweet)))
+        except Exception as e:
+            log.warning(f"[Ensemble:{label}] failed: {e}")
+
+    if len(successes) < 2:
+        log.warning("[Ensemble] <2 forecasters succeeded — falling back to single")
+        return run_forecaster_agent(market, signal_report, market_url)
+
+    pcts   = [s[1] for s in successes]
+    median = int(statistics.median(pcts))
+    best   = min(successes, key=lambda s: abs(s[1] - median))
+    log.info(f"[Ensemble] estimates={pcts} median={median} "
+             f"spread={max(pcts)-min(pcts)}pts")
+
+    # Merge + dedup citations by source_url
+    seen_urls: set[str] = set()
+    merged_cites: list[dict] = []
+    for _, _, cites in successes:
+        for c in cites:
+            url = c.get("source_url", "")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                merged_cites.append(c)
+
+    return best[0], median, merged_cites

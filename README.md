@@ -39,6 +39,71 @@ generated for each call so the basis of every estimate is reconstructible.
 
 ---
 
+## Intelligence — grounding, ensemble, calibration
+
+The forecast step is grounded in live, market-specific evidence before any model
+writes a probability. Every input below **fails open**: a missing key, a network
+error, or a bad response yields no block and never blocks a post or crashes the
+6h loop.
+
+**Grounded inputs** (assembled in the `[2.6]` stage and fed to the forecaster):
+
+- **CLOB microstructure** (`agent/integrations/clob.py`, no key) — the
+  Polymarket order-book midpoint and spread. The midpoint is a cleaner
+  probability anchor than the last trade; the book hash is recorded as a
+  citation.
+- **Per-market web search** (`agent/integrations/research.py`) — a targeted
+  query built from the question and resolution date, tried against **Brave**
+  first then **Tavily**. Each result's *full snippet* is sha256-hashed into the
+  citation (not just the title), so the evidence is tamper-evident.
+- **Principled reference-class lookup** (`agent/baserates.py`) — instead of a
+  brittle keyword→number table, a cheap LLM call classifies the question into a
+  reference class by *semantics* (keyword matching is the fail-open fallback).
+  Each class is tagged by confidence and the forecaster is told how far to trust
+  it:
+  - `measured` — a real counted historical frequency with a citable dataset
+    (e.g. US incumbent-president re-election ≈74%). Used as a reliable anchor.
+  - `prior` — a rough directional anchor where no clean dataset exists (e.g.
+    near-term conflict escalation). Labelled as such; the forecaster weights it
+    lightly and prefers the live domain signal.
+  - `redirect` — no base rate applies; the forecaster is routed to a live signal
+    (e.g. crypto price thresholds → Deribit) and asserts no base-rate number.
+- **FRED macro grounding** (`agent/integrations/fred.py`, live with
+  `FRED_API_KEY`) — latest values for the relevant series (unemployment, CPI,
+  Fed funds, 10-year, GDP) on macro/rate markets; guards FRED's `.` missing-value
+  sentinel.
+- **Deribit option-implied probability** (`agent/integrations/deribit.py`, no
+  key) — for "BTC/ETH above $X by date" markets, approximates the risk-neutral
+  `Pr(ITM) ≈ |call delta|` from the nearest-strike option.
+- **ACLED conflict grounding** (`agent/integrations/acled.py`, live with
+  `ACLED_EMAIL` + `ACLED_PASSWORD`) — 30-day event and fatality counts for the
+  country in the question, as a base-rate anchor for escalation/ceasefire
+  markets. Uses a **durable token-refresh** design: the access token is cached on
+  disk (`.acled_token.json`, gitignored), refreshed via the 14-day refresh token
+  without re-sending the password, and the cache self-heals on a 401.
+
+**Optional median-of-3 ensemble** (`ENABLE_ENSEMBLE=1`, default off) — runs three
+forecasters with different model + framing combos (gpt-oss-120b superforecaster,
+llama-3.3-70b base-rate-first, qwen3-32b devil's-advocate) and aggregates by the
+**median** of their probabilities (Schoenegger 2024). Falls back to the single
+forecaster if fewer than two succeed.
+
+**Optional calibration hook** (`ENABLE_CALIBRATION=1`, default off,
+`agent/calibration.py`) — fixed log-odds **extremization** (Baron et al. 2014)
+while the resolved sample is small, switching to **Platt scaling** (pure-Python
+logistic regression) once ≥50 calls have resolved. The raw and calibrated
+probabilities are both retained in the reasoning bundle; the calibrated value is
+what gets logged on-chain.
+
+**Per-category Brier tracking** — each call is tagged `crypto` / `macro` /
+`politics` / `geopolitics` / `other`, and the feed's `/v1/arke/track-record`
+summary exposes a `brier_by_category` breakdown alongside the headline Brier.
+
+Both toggles default **off**, so the live loop's behaviour is unchanged until the
+operator flips them.
+
+---
+
 ## On-chain artifacts
 
 | Artifact | Value |

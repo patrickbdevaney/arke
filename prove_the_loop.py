@@ -478,6 +478,80 @@ async def main(post: bool | None = None):
     except Exception as e:
         print(f"      Signal agent failed: {e} — continuing")
 
+    # ── 2.6: Grounded context ──────────────────────────────────────────────
+    print("\n[2.6/4] Grounded context — CLOB / search / base rates / domain APIs...")
+    grounded_blocks: list[str] = []
+    grounded_citations: list[dict] = []
+    try:
+        from agent.integrations.clob import (get_microstructure,
+                                              extract_yes_token_id)
+        from agent.integrations.research import research_market
+        from agent.baserates import get_base_rate, format_base_rate_block
+        from agent.integrations.fred import macro_context
+        from agent.integrations.deribit import crypto_context
+        from agent.integrations.acled import geo_context
+
+        q_text = market.get("question", "")
+
+        # CLOB microstructure — midpoint is a cleaner anchor than last-trade
+        micro = get_microstructure(extract_yes_token_id(market))
+        if micro.get("midpoint") is not None:
+            mid  = int(micro["midpoint"] * 100)
+            last = int(float(market.get("lastTradePrice", 0)) * 100)
+            sp   = (micro.get("spread") or 0) * 100
+            grounded_blocks.append(
+                f"ORDERBOOK: midpoint {mid}% (last-trade {last}%), "
+                f"spread {sp:.1f}c. Prefer midpoint as the probability anchor."
+            )
+            if micro.get("book_hash"):
+                grounded_citations.append({
+                    "claim": f"CLOB orderbook midpoint {mid}%",
+                    "source_url": "https://clob.polymarket.com/book",
+                    "retrieved_at": "",
+                    "content_sha256": micro["book_hash"],
+                })
+
+        # Per-market web search
+        rsum, rcites = research_market(market)
+        if rsum:
+            grounded_blocks.append("RESEARCH:\n" + rsum)
+            grounded_citations.extend(rcites)
+
+        # Base rate — confidence-aware phrasing so forecaster knows how much
+        # to trust the number (measured vs rough prior vs redirect-to-signal)
+        br = get_base_rate(q_text)
+        if br:
+            grounded_blocks.append(format_base_rate_block(br))
+            grounded_citations.append({
+                "claim": br["description"],
+                "source_url": br["source_url"],
+                "retrieved_at": "",
+                "content_sha256": "",
+            })
+
+        # Domain APIs — each fires only when its key is set AND the market
+        # matches; all fail open to ('', [])
+        for fn in (macro_context, crypto_context, geo_context):
+            try:
+                ctx, cites = fn(q_text)
+                if ctx:
+                    grounded_blocks.append(ctx)
+                    grounded_citations.extend(cites)
+            except Exception:
+                pass
+
+        print(f"      {len(grounded_blocks)} grounded blocks, "
+              f"{len(grounded_citations)} citations")
+
+    except Exception as e:
+        print(f"      Grounded context failed: {e} — continuing without it")
+
+    # Append grounded blocks to the signal report fed to the Forecaster
+    if grounded_blocks:
+        signal_report = (
+            (signal_report + "\n\n") if signal_report else ""
+        ) + "\n\n".join(grounded_blocks)
+
     # ── 3: Forecaster Agent ───────────────────────────────────────────
     print("\n[3/4] Forecaster Agent — generating probability estimate...")
     from agent.agents.forecaster_agent import run_forecaster_agent
@@ -488,7 +562,13 @@ async def main(post: bool | None = None):
 
     for attempt in range(3):
         try:
-            tweet, arke_pct, forecaster_citations = run_forecaster_agent(market, signal_report, market_url)
+            if os.getenv("ENABLE_ENSEMBLE") == "1":
+                from agent.agents.forecaster_agent import run_forecaster_ensemble
+                tweet, arke_pct, forecaster_citations = run_forecaster_ensemble(
+                    market, signal_report, market_url)
+            else:
+                tweet, arke_pct, forecaster_citations = run_forecaster_agent(
+                    market, signal_report, market_url)
             if tweet and len(tweet) > 20:
                 break
             print(f"      Attempt {attempt+1}: empty response — retrying")
@@ -539,7 +619,13 @@ async def main(post: bool | None = None):
             print(f"      Retrying forecaster with enriched prompt...")
             # Force another forecaster attempt with the rejection reason
             enriched_signal = (signal_report or "") + f"\n\nPREVIOUS ATTEMPT REJECTED: {filter_reason}\nMust cite a more specific verifiable fact."
-            tweet, arke_pct, forecaster_citations = run_forecaster_agent(market, enriched_signal, market_url)
+            if os.getenv("ENABLE_ENSEMBLE") == "1":
+                from agent.agents.forecaster_agent import run_forecaster_ensemble
+                tweet, arke_pct, forecaster_citations = run_forecaster_ensemble(
+                    market, enriched_signal, market_url)
+            else:
+                tweet, arke_pct, forecaster_citations = run_forecaster_agent(
+                    market, enriched_signal, market_url)
 
     # Recompute edge/position in case a retry changed Arke's estimate
     edge = arke_pct - market_pct
@@ -554,10 +640,31 @@ async def main(post: bool | None = None):
         print("\nDone.")
         return
 
+    # ── Calibration (toggle-gated; default OFF) ────────────────────
+    # Runs after the filter settles on a final arke_pct and before the
+    # provenance bundle, so the bundle + oracle log + DB store the calibrated
+    # value while keeping the raw estimate for provenance. Fails open.
+    raw_arke_pct = arke_pct
+    if os.getenv("ENABLE_CALIBRATION") == "1":
+        from agent.calibration import calibrate
+        resolved = db.get_resolved_for_calibration() if DB_AVAILABLE else []
+        arke_pct = calibrate(arke_pct, resolved)
+        print(f"      Calibration: {raw_arke_pct}% → {arke_pct}%")
+        # Recompute edge/position in case calibration shifted the estimate
+        edge = arke_pct - market_pct
+        position = "AGREE" if abs(edge) <= 3 else ("BULL" if edge > 0 else "BEAR")
+    else:
+        raw_arke_pct = None   # don't store if calibration not running
+
     # ── Provenance bundle (sha256-pinned reasoning trace) ──────────
     # Written in both dry-run and live modes; the DB cid is set only on a live
     # post (when a posted_markets row exists).
-    citations = (signal_citations or []) + (forecaster_citations or [])
+    # Merge all citation sources for the provenance bundle
+    all_citations = (
+        (signal_citations      or []) +
+        (forecaster_citations  or []) +
+        (grounded_citations    or [])
+    )
     reasoning_cid = ""
     try:
         from agent.provenance import assemble_bundle, write_trace
@@ -565,10 +672,12 @@ async def main(post: bool | None = None):
             condition_id=cid,
             arke_pct=arke_pct,
             market_pct=market_pct,
-            question=market.get("question"),
+            question=market.get("question", ""),
             council_signal=signal_report,
             council_forecast=tweet,
-            citations=citations,
+            citations=all_citations,
+            raw_arke_pct=raw_arke_pct,
+            calibrated_arke_pct=(arke_pct if raw_arke_pct is not None else None),
         )
         trace_path = write_trace(bundle, cid)
         reasoning_cid = f"sha256:{bundle_sha}"
@@ -688,4 +797,10 @@ async def main(post: bool | None = None):
 
 
 if __name__ == "__main__":
+    import logging
+    # Surface agent.* INFO logs (forecaster/ensemble/base-rate) on the CLI
+    # without third-party (httpx/groq) noise. Scoped to __main__ so importing
+    # main() from the scheduler leaves the live service's logging untouched.
+    logging.basicConfig(level=logging.WARNING, format="%(message)s")
+    logging.getLogger("agent").setLevel(logging.INFO)
     asyncio.run(main())

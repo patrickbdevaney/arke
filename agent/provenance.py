@@ -37,11 +37,18 @@ def assemble_bundle(
     council_forecast: str,
     citations: list,
     generated_at: str = None,
+    raw_arke_pct: int = None,
+    calibrated_arke_pct: int = None,
 ) -> tuple[dict, str, str]:
     """Assemble the provenance bundle.
 
     Returns (bundle, bundle_json, sha256_hex). Pass `generated_at` to make the
     output deterministic (otherwise it is stamped with the current UTC time).
+
+    `raw_arke_pct` / `calibrated_arke_pct` are only added to the bundle when
+    not None (i.e. when calibration ran), so bundles from the default,
+    calibration-off path hash exactly as before — the function stays pure and
+    deterministic in its inputs.
     """
     if generated_at is None:
         generated_at = datetime.utcnow().isoformat() + "Z"
@@ -56,6 +63,10 @@ def assemble_bundle(
         "citations": citations,
         "generated_at": generated_at,
     }
+    if raw_arke_pct is not None:
+        bundle["raw_arke_pct"] = raw_arke_pct
+    if calibrated_arke_pct is not None:
+        bundle["calibrated_arke_pct"] = calibrated_arke_pct
     bundle_json = json.dumps(bundle, sort_keys=True)
     bundle_sha256 = hashlib.sha256(bundle_json.encode()).hexdigest()
     return bundle, bundle_json, bundle_sha256

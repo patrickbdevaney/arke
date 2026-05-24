@@ -13,6 +13,9 @@ id_ed25519
 secrets.json
 .secrets
 
+# ACLED OAuth token cache (access + refresh tokens) — never commit
+.acled_token.json
+
 # Local-only security notes / threat model — never publish
 SECURITY_THREAT_MODEL.md
 *.local.md
@@ -40,3 +43,7 @@ repo_dump.txt
 # DB is the verifiable hash regardless of where the JSON is pinned)
 dashboard/public/traces/*
 !dashboard/public/traces/.gitkeep
+
+MANUAL_STEPS.MD
+
+TRACTION.MD

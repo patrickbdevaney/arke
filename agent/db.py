@@ -29,6 +29,19 @@ logger = logging.getLogger(__name__)
 DB_PATH = Path(__file__).parent.parent / "arke.db"
 
 
+def categorize(question: str) -> str:
+    q = (question or "").lower()
+    if any(k in q for k in ["bitcoin","btc","ethereum","eth","crypto","solana","defi"]):
+        return "crypto"
+    if any(k in q for k in ["fed","fomc","cpi","inflation","unemployment","gdp","recession","rate cut","rate hike"]):
+        return "macro"
+    if any(k in q for k in ["election","president","senate","congress","vote","ballot","poll","party"]):
+        return "politics"
+    if any(k in q for k in ["war","conflict","strike","missile","troops","ceasefire","sanctions","airspace","iran","russia","ukraine","israel","china","taiwan","myanmar"]):
+        return "geopolitics"
+    return "other"
+
+
 class ArkeDB:
     def __init__(self, db_path: str = None):
         self.db_path = str(db_path or DB_PATH)
@@ -239,6 +252,8 @@ class ArkeDB:
             ("posted_markets", "stake_tx", "TEXT"),
             ("posted_markets", "arke_call_yes", "INTEGER"),
             ("posted_markets", "reasoning_cid", "TEXT"),
+            # Per-category Brier tracking (intelligence upgrade)
+            ("posted_markets", "category", "TEXT NOT NULL DEFAULT ''"),
         ]
         existing = {}
         for table, col, typedef in migrations:
@@ -354,7 +369,7 @@ class ArkeDB:
                     opentweet_post_id, x_post_url, builder_code,
                     posted_at, posted_at_ts, quality_score, quality_passed,
                     arke_position, arke_probability_pct, news_context,
-                    divergence_pts
+                    divergence_pts, category
                 ) VALUES (
                     ?, ?, ?, ?, ?,
                     ?, ?, ?, ?,
@@ -362,7 +377,7 @@ class ArkeDB:
                     ?, ?, ?,
                     ?, ?, ?, ?,
                     ?, ?, ?,
-                    ?
+                    ?, ?
                 )
                 """,
                 (
@@ -391,6 +406,7 @@ class ArkeDB:
                     arke_probability_pct,
                     (news_context or "")[:500],
                     divergence_pts,
+                    categorize(market.get("question", "")),
                 ),
             )
             return cursor.lastrowid
@@ -739,6 +755,51 @@ class ArkeDB:
             "brier_index": brier_index,
             "source": "sqlite",
         }
+
+    def get_brier_by_category(self) -> dict:
+        """Return {category: {n, brier}} for all resolved calls.
+
+        Brier = mean over the category's resolved calls of (P(YES) - outcome)^2.
+        Uses arke_probability_pct as P(YES) and the `resolution` column
+        ('YES'/'NO') as the outcome.
+        """
+        from collections import defaultdict
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT category, arke_probability_pct, resolution "
+                "FROM posted_markets "
+                "WHERE resolved = 1 AND resolution IN ('YES', 'NO')"
+            ).fetchall()
+        buckets = defaultdict(list)
+        for r in rows:
+            pct = r["arke_probability_pct"]
+            if pct is None:
+                continue
+            p = max(0, min(100, int(pct))) / 100.0
+            y = 1.0 if r["resolution"] == "YES" else 0.0
+            buckets[(r["category"] or "other")].append((p - y) ** 2)
+        return {
+            cat: {"n": len(scores), "brier": round(sum(scores) / len(scores), 4)}
+            for cat, scores in buckets.items() if scores
+        }
+
+    def get_resolved_for_calibration(self) -> list[dict]:
+        """Return [{arke_pct, outcome_yes}] for all resolved calls.
+
+        Drives agent/calibration.py (extremize <50, Platt scaling >=50).
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT arke_probability_pct, resolution "
+                "FROM posted_markets "
+                "WHERE resolved = 1 AND resolution IN ('YES', 'NO') "
+                "AND arke_probability_pct IS NOT NULL"
+            ).fetchall()
+        return [
+            {"arke_pct": r["arke_probability_pct"],
+             "outcome_yes": (r["resolution"] == "YES")}
+            for r in rows
+        ]
 
     def get_accuracy_stats(self) -> dict:
         """Arke's accuracy track record. Core dashboard metric."""
