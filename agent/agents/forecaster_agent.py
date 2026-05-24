@@ -114,9 +114,11 @@ RULES:
             model=MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.5,
-            # gpt-oss-120b spends its first few hundred tokens on hidden
-            # reasoning; too small a budget truncates the tweet. Give room.
-            max_tokens=2048,
+            # gpt-oss-120b spends its hidden-reasoning budget first; with this
+            # full prompt that runs ~700–2000+ tokens, so 2048 was exhausted by
+            # reasoning before any tweet emitted (finish_reason=length, empty
+            # content). 4096 leaves room for the tweet after reasoning.
+            max_tokens=4096,
         )
         raw = (response.choices[0].message.content or "").strip()
 
