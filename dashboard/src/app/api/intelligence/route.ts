@@ -31,6 +31,10 @@ export type TrackRecordSummary = {
     nResolved: number;
     accuracyPct: number;
     brierIndex: number;
+    // Phase 3 dual scoring (off-chain, Murphy 1973). directionalPct = was the
+    // binary call right; skillBps = Brier skill vs a flat-50% reference.
+    directionalPct: number;
+    skillBps: number;
     operatingSince: string;
 };
 
@@ -60,6 +64,8 @@ export type MarketIntelligence = {
     oracleResolveTx: string | null;
     stakeTx: string | null;
     reasoningCid: string | null;
+    // Phase 4: YES outcome CLOB token id (clobTokenIds[0]); null if absent.
+    yesTokenId: string | null;
 };
 
 type GammaMarket = {
@@ -70,9 +76,27 @@ type GammaMarket = {
     volume24hr?: number | string;
     volume?: number | string;
     spread?: number | string;
+    liquidity?: number | string;
     endDateIso?: string;
     events?: Array<{ slug?: string }>;
+    clobTokenIds?: string | string[];
 };
+
+// Parse the YES outcome token id from Gamma's clobTokenIds. It arrives as a
+// JSON-string array (sometimes already an array); element [0] is the YES token.
+function parseYesTokenId(raw: string | string[] | undefined): string | null {
+    if (!raw) return null;
+    try {
+        const arr = Array.isArray(raw) ? raw : JSON.parse(raw);
+        if (Array.isArray(arr) && arr.length >= 1) {
+            const t = arr[0];
+            return typeof t === "string" && t.length > 0 ? t : null;
+        }
+    } catch {
+        /* malformed — fall through to null */
+    }
+    return null;
+}
 
 // Raw call shape served by agent/feed_server.py (snake_case).
 type FeedCall = {
@@ -99,6 +123,8 @@ type FeedResponse = {
         n_resolved: number;
         accuracy_pct: number;
         brier_index: number;
+        directional_pct?: number;
+        skill_bps?: number;
         source: string;
         oracle_contract: string | null;
         operating_since: string;
@@ -219,13 +245,14 @@ export async function GET() {
             const price = Number(m.lastTradePrice ?? 0);
             const pct = Math.round(price * 100);
             const q = m.question ?? "";
-            if (vol < 15_000 || pct < 15 || pct > 85) return false;
+            // Match the backend's wider band (Phase 2): 5–95%, vol > 10k.
+            if (vol < 10_000 || pct < 5 || pct > 95) return false;
             if (isSports(q)) return false;
             if (m.endDateIso && new Date(m.endDateIso) < now) return false;
             return true;
         })
         .sort((a, b) => Number(b.volume24hr ?? 0) - Number(a.volume24hr ?? 0))
-        .slice(0, 30)
+        .slice(0, 48)
         .map((m) => {
             const pct = Math.round(Number(m.lastTradePrice ?? 0) * 100);
             const vol = Number(m.volume24hr ?? 0);
@@ -276,6 +303,7 @@ export async function GET() {
                 oracleResolveTx: call?.oracleResolveTx ?? null,
                 stakeTx: call?.stakeTx ?? null,
                 reasoningCid: call?.reasoningCid ?? null,
+                yesTokenId: parseYesTokenId(m.clobTokenIds),
             };
         });
 
@@ -285,6 +313,8 @@ export async function GET() {
             nResolved: feed.summary.n_resolved,
             accuracyPct: feed.summary.accuracy_pct,
             brierIndex: feed.summary.brier_index,
+            directionalPct: feed.summary.directional_pct ?? 0,
+            skillBps: feed.summary.skill_bps ?? 0,
             operatingSince: feed.summary.operating_since,
         }
         : null;

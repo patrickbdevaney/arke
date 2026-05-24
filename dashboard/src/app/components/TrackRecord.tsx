@@ -15,6 +15,7 @@ import type { TrackRecordCall, TrackRecordSummary } from "../api/intelligence/ro
 const ARCSCAN = "https://testnet.arcscan.app";
 const POLYGONSCAN = "https://polygonscan.com";
 const ERC8004_REGISTRY = "0x8004A818BFB912233c491871b3d84c89A494BD9e";
+const ERC8004_REP_REGISTRY = "0x8004B663056A597Dffe9eCcC1965A193B7388713";
 const ORACLE_FALLBACK = "0x767D0eD2850D57C4EF969976088Be44A5Adcfa07";
 
 function CopyButton({ value }: { value: string }) {
@@ -104,7 +105,11 @@ export function TrackRecord({
                     <>
                         <Stat value={String(summary.nTotal)} label={`CALLS SINCE MAY 18 2026`} />
                         <Stat value={String(summary.nResolved)} label="RESOLVED" />
-                        <Stat value={`${summary.accuracyPct}%`} label="ACCURACY" accent />
+                        <Stat value={`${summary.directionalPct}%`} label="DIRECTIONAL" accent />
+                        <Stat
+                            value={`${summary.skillBps >= 0 ? "+" : ""}${summary.skillBps}`}
+                            label="SKILL bps"
+                        />
                         <Stat value={String(summary.brierIndex)} label="BRIER" />
                     </>
                 ) : (
@@ -128,13 +133,24 @@ export function TrackRecord({
                 >
                     ERC-8004 ID #20360
                 </a>
+                <a
+                    href={`${ARCSCAN}/address/${ERC8004_REP_REGISTRY}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-xs text-neutral-500 hover:text-neutral-300"
+                >
+                    ERC-8004 Reputation →
+                </a>
             </div>
 
-            {/* What the accuracy number means */}
+            {/* What the numbers mean */}
             {summary && summary.nResolved > 0 && (
                 <div className="text-xs text-neutral-600 font-mono mt-2">
-                    {"// "}directional accuracy (was Arke right?) · on-chain edge accuracy:{" "}
-                    0% (did Arke beat consensus?)
+                    {"// "}directional (binary correct) · skill vs random (Murphy 1973) ·
+                    on-chain edge (beat consensus) — see{" "}
+                    <a href="/calibration" className="text-amber-700 hover:text-amber-500">
+                        /calibration
+                    </a>
                     <a
                         href={`${ARCSCAN}/address/${oracleContract ?? ORACLE_FALLBACK}#readContract`}
                         className="text-amber-700 hover:text-amber-500 ml-2"

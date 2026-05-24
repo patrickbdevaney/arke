@@ -53,8 +53,13 @@ def _get_client() -> tweepy.Client:
     )
 
 
-async def post_tweet(tweet: str) -> dict:
-    """Post tweet via X API v2. Returns response dict or empty on failure."""
+async def post_tweet(tweet: str, quote_tweet_id: str | None = None) -> dict:
+    """Post tweet via X API v2. Returns response dict or empty on failure.
+
+    When quote_tweet_id is set, the tweet is posted as a quote-tweet of that
+    status id (used by the resolver's RESOLUTION post to quote the original
+    call). An invalid/missing id falls back to a standalone post.
+    """
     api_key = _consumer_key()
     if not api_key:
         log.warning("[X] consumer key not set (X_API_KEY / X_API_CONSUMER_KEY) — skipping post")
@@ -62,7 +67,10 @@ async def post_tweet(tweet: str) -> dict:
 
     try:
         client = _get_client()
-        response = client.create_tweet(text=tweet)
+        kwargs = {"text": tweet}
+        if quote_tweet_id:
+            kwargs["quote_tweet_id"] = quote_tweet_id
+        response = client.create_tweet(**kwargs)
         tweet_id = response.data["id"]
         x_url = f"https://x.com/arke_ai/status/{tweet_id}"
         log.info(f"[X] Posted successfully: {x_url}")

@@ -209,6 +209,49 @@ def get_call(condition_id: str, request: Request):
     return _empty_call(condition_id)
 
 
+@app.get("/v1/arke/calibration")
+def calibration():
+    """Always free. Calibration data is marketing, never a product to gate."""
+    db = _db()
+    scores = db.get_dual_scores()
+    rows = [r for r in db.get_track_record(limit=1000)
+            if r.get("resolved") and r.get("resolution") in ("YES", "NO")
+            and r.get("arke_probability_pct") is not None]
+    bins = [{"bin": i, "lo": i * 10, "hi": i * 10 + 10, "n": 0, "yes": 0}
+            for i in range(10)]
+    for r in rows:
+        b = min(9, int(r["arke_probability_pct"]) // 10)
+        bins[b]["n"] += 1
+        if r["resolution"] == "YES":
+            bins[b]["yes"] += 1
+    for b in bins:
+        b["empirical_pct"] = (round(100 * b["yes"] / b["n"])
+                              if b["n"] else None)
+    return {"scores": scores, "reliability_bins": bins,
+            "operating_since": OPERATING_SINCE,
+            "note": ("skill_bps measures Arke vs a flat-50% reference — "
+                     "positive means Arke outperformed random. "
+                     "directional_pct measures whether the binary call was right.")}
+
+
+@app.get("/v1/arke/builder")
+def builder_info():
+    """Free, ungated. Surfaces Arke's Polymarket builder attribution so the
+    dashboard and any client can show where builder fees accrue."""
+    address = os.getenv("POLY_BUILDER_ADDRESS", "")
+    code = os.getenv("POLY_BUILDER_CODE", "")
+    return {
+        "builder_address": address or None,
+        "builder_code_prefix": (code[:10] + "..." if len(code) > 10 else code) or None,
+        "polymarket_profile": (f"https://polymarket.com/profile/{address}"
+                               if address else None),
+        "fee_rate_bps": 50,
+        "note": ("Builder fees (0.5%) accrue on fills from orders submitted "
+                 "through arke.live's TradeWidget. builderCode bytes32 is "
+                 "injected server-side into every signed EIP-712 order struct."),
+    }
+
+
 @app.get("/v1/arke/track-record")
 def track_record(request: Request):
     gated = _payment_gate(request, PRICE_TRACK_RECORD)
@@ -222,6 +265,11 @@ def track_record(request: Request):
     except Exception as e:
         log.warning(f"[feed] brier_by_category failed: {e}")
         brier_by_category = {}
+    try:
+        dual = db.get_dual_scores()
+    except Exception as e:
+        log.warning(f"[feed] dual_scores failed: {e}")
+        dual = {"directional_pct": 0, "skill_bps": 0}
     return {
         "summary": {
             "n_total": summary["n_total"],
@@ -229,6 +277,8 @@ def track_record(request: Request):
             "accuracy_pct": summary["accuracy_pct"],
             "brier_index": summary["brier_index"],
             "brier_by_category": brier_by_category,
+            "directional_pct": dual.get("directional_pct", 0),
+            "skill_bps": dual.get("skill_bps", 0),
             "source": "sqlite",
             "oracle_contract": os.getenv("ORACLE_CONTRACT_ADDRESS") or None,
             "operating_since": OPERATING_SINCE,

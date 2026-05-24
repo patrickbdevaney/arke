@@ -176,13 +176,22 @@ def _resolve_token_and_side(market: dict, arke_pct: int) -> tuple[str, str]:
 
 
 async def fetch_arke_feed() -> list[dict]:
-    """Fetch top 100 markets by 24hr volume, filter to actionable set."""
+    """Fetch top 500 markets by 24hr volume, filter to actionable set.
+
+    Wider coverage: 500 markets and a 5–95% probability band (was 100 / 15–85%)
+    surface tail markets where Arke's edge vs the crowd is largest. Tighter
+    quality gates compensate: Polymarket's 24h volume roughly double-counts
+    maker+taker legs and includes wash/incentive churn (Paradigm, Dec 2025), so
+    the nominal volume bar drops to 10k but a real-liquidity gate (>$25k resting
+    book) and a tight-spread gate (<5c) are added to screen out wash-inflated
+    thin books that a volume threshold alone lets through.
+    """
     async with httpx.AsyncClient(timeout=15.0) as client:
         r = await client.get(
             "https://gamma-api.polymarket.com/markets",
             params={
                 "active": "true",
-                "limit": 100,
+                "limit": 500,
                 "order": "volume24hr",
                 "ascending": "false",
             },
@@ -192,16 +201,45 @@ async def fetch_arke_feed() -> list[dict]:
 
     feed = []
     for m in markets:
-        vol = float(m.get("volume24hr", 0))
-        price = float(m.get("lastTradePrice", 0))
+        vol = float(m.get("volume24hr", 0) or 0)
+        liquidity = float(m.get("liquidity", 0) or 0)
+        spread = float(m.get("spread", 0) or 0)
+        price = float(m.get("lastTradePrice", 0) or 0)
         pct = int(price * 100)
         q = m.get("question", "")
 
-        if vol > 15_000 and 15 <= pct <= 85 and not is_sports(q):
+        if (
+            vol > 10_000
+            and liquidity > 25_000
+            and spread < 0.05
+            and 5 <= pct <= 95
+            and not is_sports(q)
+        ):
             feed.append(m)
 
-    feed.sort(key=lambda m: float(m.get("volume24hr", 0)), reverse=True)
+    feed.sort(key=lambda m: float(m.get("volume24hr", 0) or 0), reverse=True)
     return feed
+
+
+def _category_cooldown_hours(question: str) -> int:
+    """Per-category re-post cooldown in hours. Mirrors
+    agent.integrations.polymarket.CATEGORY_COOLDOWN_HOURS so the live loop and
+    the helper module agree on the cadence."""
+    from agent.integrations.polymarket import CATEGORY_COOLDOWN_HOURS
+    from agent.db import categorize
+    return CATEGORY_COOLDOWN_HOURS.get(categorize(question), 48)
+
+
+def market_in_cooldown(m: dict) -> bool:
+    """Category-aware cooldown check used by both pick_best_market and the
+    MARKET WATCH fallback detection in main(). Fails open (False) without a DB."""
+    if not DB_AVAILABLE:
+        return False
+    try:
+        hours = _category_cooldown_hours(m.get("question", ""))
+        return db.already_posted(m.get("conditionId", ""), cooldown_hours=hours)
+    except Exception:
+        return False
 
 
 def pick_best_market(feed: list[dict]) -> dict | None:
@@ -212,17 +250,15 @@ def pick_best_market(feed: list[dict]) -> dict | None:
     2. Medium term (7-30 days), not in cooldown, highest volume
     3. Any market not in cooldown
     4. Final fallback: top market regardless of cooldown (with warning)
+
+    Cooldown is per-category (see CATEGORY_COOLDOWN_HOURS): crypto markets
+    resurface after 24h, geopolitics is held 96h.
     """
     import datetime
     today = datetime.date.today()
 
     def in_cooldown(m: dict) -> bool:
-        if not DB_AVAILABLE:
-            return False
-        try:
-            return db.already_posted(m.get("conditionId", ""), cooldown_hours=48)
-        except Exception:
-            return False
+        return market_in_cooldown(m)
 
     def days_left(m: dict) -> int:
         try:
@@ -444,8 +480,31 @@ async def main(post: bool | None = None):
     if DB_AVAILABLE:
         for m in feed:
             if m.get("conditionId") != cid:
-                if db.already_posted(m.get("conditionId", "")):
-                    db.record_skip(m, "cooldown_48hr")
+                if market_in_cooldown(m):
+                    db.record_skip(m, "category_cooldown")
+
+    # ── MARKET WATCH detection ─────────────────────────────────────
+    # If every actionable market is within its per-category cooldown, then
+    # pick_best_market returned the stale top-market fallback. Re-running the
+    # full council on a stale market produces a near-duplicate post; instead
+    # signal the caller (the scheduler) to post a MARKET WATCH summary. Returns
+    # before the council runs so no LLM budget is spent on a stale market.
+    all_cooldown = (
+        DB_AVAILABLE and bool(feed) and all(market_in_cooldown(m) for m in feed)
+    )
+    if all_cooldown:
+        print("      [MARKET WATCH] all markets in cooldown — skipping council, "
+              "signaling watch summary")
+        duration_ms = int((time.time() - run_start) * 1000)
+        if DB_AVAILABLE:
+            db.record_run(
+                "skipped",
+                market_selected="(all markets in cooldown)",
+                error_message="market_watch_fallback",
+                duration_ms=duration_ms,
+            )
+        print(f"\nDone. ({duration_ms}ms)")
+        return "all_cooldown"
 
     # ── 2.5: Signal Agent ─────────────────────────────────────────────
     print("\n[2.5/4] Signal Agent — aggregating context...")

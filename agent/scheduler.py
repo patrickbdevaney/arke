@@ -68,15 +68,85 @@ def _log_db_stats():
         logger.warning("DB stats unavailable: %s", e)
 
 
+async def post_market_watch(db, post: bool = False):
+    """Post a structured 'watching' summary instead of a stale re-post.
+
+    Fires from run_loop() when every actionable market is within its
+    per-category cooldown (loop_main returns "all_cooldown"). Picks the top 3
+    markets not posted in the last 6h and tweets that Arke is monitoring rather
+    than re-running the council on a stale market. Gated on post=True so dry
+    runs never tweet. Fails open — any error is logged and ignored.
+    """
+    try:
+        from prove_the_loop import fetch_arke_feed
+        feed = await fetch_arke_feed()
+    except Exception as e:
+        logger.warning("[MarketWatch] feed fetch failed (skipping): %s", e)
+        return None
+
+    top3 = []
+    for m in feed[:20]:
+        try:
+            fresh = not db.already_posted(m.get("conditionId", ""), cooldown_hours=6)
+        except Exception:
+            fresh = True
+        if fresh:
+            top3.append(m)
+        if len(top3) >= 3:
+            break
+
+    if not top3:
+        logger.info("[MarketWatch] nothing fresh to watch — skipping")
+        return None
+
+    lines = ["Arke is monitoring markets. No new high-edge call this cycle."]
+    for m in top3:
+        q = (m.get("question", "") or "")[:60]
+        try:
+            pct = int(float(m.get("lastTradePrice", 0) or 0) * 100)
+            lines.append(f"Watching: {q} ({pct}%)")
+        except Exception:
+            lines.append(f"Watching: {q}")
+    text = "\n".join(lines)
+    if len(text) > 280:  # X hard limit
+        text = text[:277] + "..."
+
+    if not post:
+        logger.info("[MarketWatch] DRY RUN — would post:\n%s", text)
+        return text
+
+    try:
+        from agent.integrations.opentweet import post_tweet
+        result = await post_tweet(text)
+        if result:
+            logger.info("[MarketWatch] posted watch summary")
+        else:
+            logger.warning("[MarketWatch] post returned empty — see [X] logs")
+        return result
+    except Exception as e:
+        logger.warning("[MarketWatch] post failed (continuing): %s", e)
+        return None
+
+
 def run_loop():
-    """Wraps asyncio.run(loop_main(post=True)) in try/except. Logs duration."""
+    """Wraps asyncio.run(loop_main(post=True)) in try/except. Logs duration.
+
+    If the loop reports every market is in cooldown ("all_cooldown"), posts a
+    MARKET WATCH summary instead of letting the loop re-post a stale market.
+    """
     start = time.time()
     logger.info("=== Arke Agent Starting ===")
     _log_db_stats()
     try:
-        asyncio.run(loop_main(post=True))
+        status = asyncio.run(loop_main(post=True))
+        if status == "all_cooldown":
+            logger.info("=== All markets in cooldown — posting MARKET WATCH ===")
+            try:
+                asyncio.run(post_market_watch(ArkeDB(), post=True))
+            except Exception as e:
+                logger.warning("MARKET WATCH post failed (continuing): %s", e)
         duration = time.time() - start
-        logger.info("=== Run complete in %.1fs — POSTED ===", duration)
+        logger.info("=== Run complete in %.1fs ===", duration)
     except Exception as e:
         duration = time.time() - start
         logger.exception("Run failed after %.1fs: %s", duration, e)
@@ -87,7 +157,7 @@ def run_resolver():
     start = time.time()
     logger.info("=== Resolver Starting ===")
     try:
-        result = asyncio.run(check_resolutions())
+        result = asyncio.run(check_resolutions(post=True))
         duration = time.time() - start
         logger.info(
             "=== Resolver complete in %.1fs: checked=%s resolved=%s ===",

@@ -783,6 +783,44 @@ class ArkeDB:
             for cat, scores in buckets.items() if scores
         }
 
+    def get_dual_scores(self) -> dict:
+        """Compute directional accuracy and Brier skill score entirely off-chain
+        from resolved calls already in the DB. The live oracle contract is
+        unchanged — skill scoring lives here.
+
+        Returns: directional_pct, skill_bps, brier, n_resolved, by_category.
+        skill_bps = (1 - Brier/Brier_ref) * 10000 where Brier_ref is a flat 50%
+        forecast — this is the Murphy (1973) decomposition skill score. A positive
+        skill_bps means Arke outperformed random. The Bitcoin call at 85%/YES
+        yields skill_bps ~+5100 even though edge vs market is 0 — that's correct:
+        the contract's getAccuracy() measures edge-vs-consensus; this measures
+        skill-vs-reference. Both are valid, different questions."""
+        rows = [r for r in self.get_track_record(limit=1000)
+                if r.get("resolved") and r.get("resolution") in ("YES", "NO")
+                and r.get("arke_probability_pct") is not None]
+        if not rows:
+            return {"directional_pct": 0, "skill_bps": 0, "brier": None,
+                    "n_resolved": 0, "by_category": {}}
+        n = len(rows)
+        correct, brier_sum, ref_sum = 0, 0.0, 0.0
+        for r in rows:
+            p = max(0.01, min(0.99, r["arke_probability_pct"] / 100.0))
+            y = 1.0 if r["resolution"] == "YES" else 0.0
+            if (p >= 0.5) == (y == 1.0):
+                correct += 1
+            brier_sum += (p - y) ** 2
+            ref_sum += (0.5 - y) ** 2
+        brier = brier_sum / n
+        ref = ref_sum / n
+        skill = (1.0 - brier / ref) if ref > 0 else 0.0
+        return {
+            "directional_pct": round(100 * correct / n),
+            "skill_bps":       round(skill * 10000),
+            "brier":           round(brier, 4),
+            "n_resolved":      n,
+            "by_category":     self.get_brier_by_category(),
+        }
+
     def get_resolved_for_calibration(self) -> list[dict]:
         """Return [{arke_pct, outcome_yes}] for all resolved calls.
 

@@ -39,6 +39,75 @@ generated for each call so the basis of every estimate is reconstructible.
 
 ---
 
+## Product — dashboard, scoring, coverage, trade widget
+
+The public surface is a Next.js dashboard ([arke.live](https://arke.live)) plus a
+small x402 feed. The oracle contract is **unchanged** — everything below is
+additive, and every new path **fails open**.
+
+- **Tabbed dashboard.** The home page splits markets into
+  `COVERED · MONITORING · RESOLVED` tabs (deep-linkable via `?tab=`). COVERED
+  cards lead with big MARKET / ARKE / EDGE numbers and tuck the council reasoning
+  behind a disclosure; MONITORING and RESOLVED are dense tables. Numbers render in
+  a monospace *data* font, prose in a sans *prose* font. A contrarian Arke stance
+  (BEAR / DISAGREE) is blue — red is reserved for resolution losses only.
+  `/track-record` and `/calibration` are their own routes; marketing copy lives
+  on `/about`.
+
+- **Dual scoring (off-chain, Murphy 1973).** `db.get_dual_scores()` computes two
+  numbers from resolved calls already in the DB:
+  - **directional %** — was the binary call right (was Arke on the correct side)?
+  - **skill (bps)** — the Murphy (1973) skill score, `(1 − Brier / Brier_ref) ×
+    10000`, where `Brier_ref` is a flat-50% forecast. Positive means Arke beat a
+    coin flip.
+
+  These answer a *different question* than the contract's `getAccuracy()`. A
+  Bitcoin call at 85% that resolves YES scores ~**+5100 bps skill** (it was a
+  confident, correct probability) even though its **edge vs the market is ~0**
+  (the crowd agreed). Both are valid: the contract measures *edge vs consensus*;
+  the skill score measures *forecast quality vs random*. The skill score is
+  computed **entirely off-chain** from existing data — the oracle is not touched.
+  A free, never-gated `GET /v1/arke/calibration` endpoint serves the dual scores
+  plus a 10-bin reliability diagram, rendered at `/calibration`.
+
+- **Wider coverage, per-category cooldowns.** The feed now pulls 500 markets
+  (was 100) across a 5–95% band (was 15–85%) to surface tail markets where Arke's
+  edge is largest, with tighter quality gates to compensate (real liquidity
+  > $25k, spread < 5c; the volume bar drops to $10k because Polymarket's reported
+  24h volume roughly double-counts maker+taker legs). Re-post cooldowns are
+  per-category: crypto resurfaces after 24h, geopolitics is held 96h.
+
+- **MARKET WATCH + resolution posts.** When every market is within its cooldown,
+  Arke posts a short *MARKET WATCH* summary instead of re-running the council on a
+  stale market. When a market resolves, the resolver posts a *RESOLUTION* tweet
+  (quote-tweeting the original call) with Arke %, market %, outcome, directional
+  hit/miss, and per-call skill bps. Both are gated on the live `post=True` flag —
+  dry runs never tweet.
+
+- **Builder attribution + trade widget.** Tweets already carry a `?ref=` builder
+  link. The dashboard's `TradeWidget` lets a visitor sign their **own** Polymarket
+  order in their wallet (`window.ethereum`, EIP-712 — the exact same order struct
+  and domain as `polymarket_stake.py`) and submits it via `/api/trade`, which
+  injects Arke's `builderCode` bytes32 **server-side** (never exposed to the
+  browser). Polymarket then attributes the 0.5% builder fee to Arke on that fill.
+  **No funds are at risk on Arke's side** and there is no server custody — the
+  user signs their own order. Fees only accrue when other users *voluntarily*
+  trade through the widget. The plain "Trade on Polymarket ▸" link is the
+  no-wallet fallback and earns nothing (Polymarket's own frontend uses its own
+  builder code), so the widget is the revenue path and the link is fallback UX.
+
+- **ERC-8004 Reputation Registry.** Arke is ERC-8004 agent **#20360** (Identity
+  Registry `0x8004A8…`). The Reputation Registry (`0x8004B6…`) was verified
+  **deployed on Arc testnet** (an EIP-1967 proxy) before wiring, so after each
+  resolver run Arke writes its current skill score to it via
+  `giveFeedback(agentId, skill_bps, 0, keccak("brier_skill"), keccak("directional"))`
+  as a clearly-labelled self-attestation. Both registries are linked from the
+  dashboard header, the oracle page, and the track record. (If the registry had
+  not been deployed, this step would no-op and the writer would simply log and
+  skip — it fails open like everything else.)
+
+---
+
 ## Intelligence — grounding, ensemble, calibration
 
 The forecast step is grounded in live, market-specific evidence before any model

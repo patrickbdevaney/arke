@@ -21,6 +21,17 @@ logger = logging.getLogger(__name__)
 
 GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 
+# Per-category re-post cooldowns (hours). Crypto markets move intraday so they
+# can resurface daily; geopolitics resolves on a multi-day news cycle so a 4-day
+# cooldown avoids spamming the same conflict. Applied by pick_best_market().
+CATEGORY_COOLDOWN_HOURS = {
+    "crypto":      24,
+    "macro":       72,
+    "politics":    48,
+    "geopolitics": 96,
+    "other":       48,
+}
+
 SPORTS_KEYWORDS = [
     "vs.", "vs ", "O/U", "Spread:", "Map ", "BO3", "BO5", "BO7",
     "Pistons", "Cavaliers", "Spurs", "Lakers", "Dodgers", "Red Sox",
@@ -66,14 +77,28 @@ def get_event_context(market: dict) -> str:
 
 
 async def fetch_arke_feed() -> list[dict]:
-    """Fetch top markets by 24hr volume; filter to actionable set."""
+    """Fetch top markets by 24hr volume; filter to actionable set.
+
+    Pulls 500 markets (was 100) and widens the probability band to 5–95% (was
+    15–85%) so tail markets — where Arke's edge vs the crowd is largest — are in
+    scope. Quality filters are tightened to compensate:
+
+      * vol > 10_000 (was 15k). Polymarket's reported 24h volume roughly
+        double-counts maker+taker legs (see Paradigm's Dec 2025 liquidity
+        analysis) and a slice is wash/incentive churn, so the effective real
+        flow at the old 15k bar was already low. Lowering the nominal bar to 10k
+        while ADDING the liquidity + spread gates below filters out wash-inflated
+        thin books far more reliably than a volume threshold alone.
+      * liquidity > 25_000 — a real resting order book, not a single LP.
+      * spread < 0.05 — a tight two-sided market, not a stale quote.
+    """
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.get(
                 GAMMA_URL,
                 params={
                     "active": "true",
-                    "limit": 100,
+                    "limit": 500,
                     "order": "volume24hr",
                     "ascending": "false",
                 },
@@ -88,13 +113,21 @@ async def fetch_arke_feed() -> list[dict]:
     for m in markets:
         try:
             vol = float(m.get("volume24hr", 0) or 0)
+            liquidity = float(m.get("liquidity", 0) or 0)
+            spread = float(m.get("spread", 0) or 0)
             price = float(m.get("lastTradePrice", 0) or 0)
             pct = int(price * 100)
             q = m.get("question", "") or ""
         except (TypeError, ValueError):
             continue
 
-        if vol > 15_000 and 15 <= pct <= 85 and not is_sports(q):
+        if (
+            vol > 10_000
+            and liquidity > 25_000
+            and spread < 0.05
+            and 5 <= pct <= 95
+            and not is_sports(q)
+        ):
             feed.append(m)
 
     feed.sort(key=lambda m: float(m.get("volume24hr", 0) or 0), reverse=True)
@@ -105,9 +138,17 @@ async def fetch_arke_feed() -> list[dict]:
 def pick_best_market(feed: list[dict], db=None) -> dict | None:
     """Prefer markets resolving in 0-30 days that aren't in cooldown.
     Fallback to any not in cooldown. Final fallback: top market with warning.
+
+    Cooldown is per-category (CATEGORY_COOLDOWN_HOURS): a crypto market can
+    resurface after 24h while a geopolitics market is held for 96h. The
+    category is derived from the question via agent.db.categorize().
     """
     if not feed:
         return None
+
+    # Local import avoids a circular import (agent.db imports nothing from here,
+    # but keeping it lazy mirrors the rest of the codebase's db usage).
+    from agent.db import categorize
 
     today = datetime.date.today()
 
@@ -115,7 +156,9 @@ def pick_best_market(feed: list[dict], db=None) -> dict | None:
         if db is None:
             return False
         try:
-            return db.already_posted(m.get("conditionId", ""), cooldown_hours=48)
+            cat = categorize(m.get("question", ""))
+            hours = CATEGORY_COOLDOWN_HOURS.get(cat, 48)
+            return db.already_posted(m.get("conditionId", ""), cooldown_hours=hours)
         except Exception:
             return False
 

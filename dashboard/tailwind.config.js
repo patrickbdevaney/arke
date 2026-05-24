@@ -24,6 +24,29 @@ module.exports = {
                     "ui-monospace",
                     "monospace"
                 ],
+                // Data: numbers, conditionIds, tickers, CIDs — monospace for
+                // alignment of tabular figures (same stack as `mono`).
+                data: [
+                    '"JetBrains Mono"',
+                    '"Fira Code"',
+                    '"Cascadia Code"',
+                    "ui-monospace",
+                    "monospace"
+                ],
+                // Prose: question text, blockquotes, footer/about copy. A
+                // system sans stack (Inter if installed) — no next/font network
+                // fetch, so the build stays deterministic and dependency-free.
+                prose: [
+                    "Inter",
+                    "ui-sans-serif",
+                    "system-ui",
+                    "-apple-system",
+                    '"Segoe UI"',
+                    "Roboto",
+                    '"Helvetica Neue"',
+                    "Arial",
+                    "sans-serif"
+                ],
             },
         },
     },

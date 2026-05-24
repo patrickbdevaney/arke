@@ -10,6 +10,8 @@ Provides:
 
 import json
 import logging
+import os
+import re
 
 import httpx
 
@@ -18,6 +20,108 @@ from agent.db import ArkeDB
 logger = logging.getLogger(__name__)
 
 GAMMA_URL = "https://gamma-api.polymarket.com/markets"
+ARCSCAN = "https://testnet.arcscan.app"
+
+
+def _per_call_skill_bps(arke_pct: int, outcome_yes: bool) -> int:
+    """Per-call Murphy (1973) skill score vs a flat-50% reference, in bps.
+
+    skill = 1 - Brier/Brier_ref, where Brier_ref for a single call is the
+    (0.5 - outcome)^2 = 0.25 of an always-50% forecast. Positive = better than
+    a coin flip on this call. Mirrors db.get_dual_scores() for the aggregate.
+    """
+    p = max(0.01, min(0.99, arke_pct / 100.0))
+    y = 1.0 if outcome_yes else 0.0
+    brier = (p - y) ** 2
+    ref = (0.5 - y) ** 2  # = 0.25
+    skill = (1.0 - brier / ref) if ref > 0 else 0.0
+    return round(skill * 10000)
+
+
+def _tweet_id_from_url(url: str | None) -> str | None:
+    """Extract the numeric status id from an x.com/.../status/<id> URL."""
+    m = re.search(r"/status/(\d+)", url or "")
+    return m.group(1) if m else None
+
+
+def compose_resolution_post(
+    question: str | None,
+    arke_pct: int | None,
+    market_pct: int | None,
+    outcome: str,
+    was_correct: bool,
+    resolve_tx: str = "",
+) -> str:
+    """Compose the RESOLUTION tweet body.
+
+    RESOLVED: <question ≤80 chars>
+    Arke: X% · Market: Y% · Outcome: YES/NO
+    Directional: ✓ correct / ✗ wrong  |  Skill: ±N bps
+    ⛓ <oracle link>
+    """
+    q = (question or "")[:80]
+    arke_s = f"{arke_pct}%" if arke_pct is not None else "—"
+    mkt_s = f"{market_pct}%" if market_pct is not None else "—"
+    dir_s = "✓ correct" if was_correct else "✗ wrong"
+    skill_s = ""
+    if arke_pct is not None:
+        skill_s = f"  |  Skill: {_per_call_skill_bps(arke_pct, outcome == 'YES'):+d} bps"
+
+    if resolve_tx:
+        link = f"{ARCSCAN}/tx/{resolve_tx}"
+    elif os.getenv("ORACLE_CONTRACT_ADDRESS"):
+        link = f"{ARCSCAN}/address/{os.getenv('ORACLE_CONTRACT_ADDRESS')}"
+    else:
+        link = "https://arke.live/oracle"
+
+    return "\n".join([
+        f"RESOLVED: {q}",
+        f"Arke: {arke_s} · Market: {mkt_s} · Outcome: {outcome}",
+        f"Directional: {dir_s}{skill_s}",
+        f"⛓ {link}",
+    ])
+
+
+async def _post_resolution(
+    db: ArkeDB,
+    cid: str,
+    question: str | None,
+    arke_pct: int | None,
+    market_pct: int | None,
+    outcome: str,
+    was_correct: bool,
+    resolve_tx: str,
+) -> None:
+    """Compose + post the RESOLUTION tweet, quote-tweeting the original call
+    when its x_post_url is known. Fails open — never raises into the loop."""
+    text = compose_resolution_post(
+        question, arke_pct, market_pct, outcome, was_correct, resolve_tx)
+
+    x_url = None
+    try:
+        with db._conn() as conn:
+            r = conn.execute(
+                "SELECT x_post_url FROM posted_markets "
+                "WHERE condition_id = ? AND x_post_url IS NOT NULL "
+                "AND x_post_url != '' ORDER BY posted_at_ts DESC LIMIT 1",
+                (cid,),
+            ).fetchone()
+            if r:
+                x_url = r["x_post_url"]
+    except Exception:
+        pass
+
+    quote_id = _tweet_id_from_url(x_url)
+    try:
+        from agent.integrations.opentweet import post_tweet
+        result = await post_tweet(text, quote_tweet_id=quote_id)
+        if result:
+            logger.info(f"[Resolver] RESOLUTION posted for {cid[:12]}"
+                        f"{' (quote)' if quote_id else ''}")
+        else:
+            logger.warning(f"[Resolver] RESOLUTION post empty for {cid[:12]}")
+    except Exception as e:
+        logger.warning(f"[Resolver] RESOLUTION post failed (continuing): {e}")
 
 
 def _parse_outcome(market_data: dict) -> str | None:
@@ -99,8 +203,12 @@ async def _fetch_market(client: httpx.AsyncClient, condition_id: str) -> dict | 
     return None
 
 
-async def check_resolutions() -> dict:
-    """Find unresolved past-end-date markets, check Gamma, mark resolutions."""
+async def check_resolutions(post: bool = False) -> dict:
+    """Find unresolved past-end-date markets, check Gamma, mark resolutions.
+
+    When post=True, each newly resolved call also fires a RESOLUTION tweet
+    (quote-tweeting the original when known). Gated so dry runs never post.
+    """
     db = ArkeDB()
     unresolved = db.get_unresolved_past_enddate()
     logger.info(f"[Resolver] {len(unresolved)} unresolved markets past end_date")
@@ -153,16 +261,44 @@ async def check_resolutions() -> dict:
                 f"| {row.get('question', '')[:60]}"
             )
 
+            # Arke's own estimate + the market consensus at post time, for the
+            # RESOLUTION tweet. First post with a stored estimate wins.
+            arke_pct = market_pct = None
+            for p in posts:
+                if arke_pct is None and p.get("arke_probability_pct") is not None:
+                    arke_pct = int(p["arke_probability_pct"])
+                if market_pct is None and p.get("probability_pct") is not None:
+                    market_pct = int(p["probability_pct"])
+
             # Write the resolution onchain so the Brier ledger updates. Fails
             # silently — a chain error must never abort the resolver loop.
+            resolve_tx = ""
             try:
                 from agent.integrations.oracle import resolve_prediction_onchain
-                tx = resolve_prediction_onchain(cid, outcome == "YES")
-                if tx:
-                    logger.info(f"[Resolver] onchain resolution {cid[:12]} -> {tx[:20]}")
-                    db.record_oracle_resolution_tx(cid, tx)
+                resolve_tx = resolve_prediction_onchain(cid, outcome == "YES") or ""
+                if resolve_tx:
+                    logger.info(f"[Resolver] onchain resolution {cid[:12]} -> {resolve_tx[:20]}")
+                    db.record_oracle_resolution_tx(cid, resolve_tx)
             except Exception as e:
                 logger.warning(f"[Resolver] onchain resolve failed (continuing): {e}")
+
+            # RESOLUTION quote-tweet (post=True only). Fails open.
+            if post:
+                await _post_resolution(
+                    db, cid, row.get("question"), arke_pct, market_pct,
+                    outcome, was_correct, resolve_tx,
+                )
+
+    # After all resolutions settle, push Arke's current skill score to the
+    # ERC-8004 Reputation Registry (Phase 5). Fails open — never blocks.
+    if resolved_count > 0:
+        try:
+            from agent.integrations.erc8004_reputation import write_reputation
+            scores = db.get_dual_scores()
+            if scores.get("n_resolved", 0) > 0:
+                write_reputation(scores["skill_bps"], scores["directional_pct"])
+        except Exception as e:
+            logger.debug(f"[Resolver] reputation write skipped: {e}")
 
     return {
         "markets_checked": len(unresolved),

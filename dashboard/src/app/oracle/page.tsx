@@ -7,6 +7,7 @@ const ARCSCAN = "https://testnet.arcscan.app";
 const ORACLE = "0x767D0eD2850D57C4EF969976088Be44A5Adcfa07";
 const ERC8004_ID = "20360";
 const ERC8004_REGISTRY = "0x8004A818BFB912233c491871b3d84c89A494BD9e";
+const ERC8004_REP_REGISTRY = "0x8004B663056A597Dffe9eCcC1965A193B7388713";
 
 async function getCalls(): Promise<{
   calls: TrackRecordCall[];
@@ -80,6 +81,22 @@ export default async function OraclePage() {
                          hover:text-neutral-200 px-3 py-1.5"
             >
               ERC-8004 Identity #{ERC8004_ID} →
+            </a>
+            <a
+              href={`${ARCSCAN}/address/${ERC8004_REP_REGISTRY}`}
+              target="_blank" rel="noopener noreferrer"
+              className="border border-neutral-700 text-neutral-400
+                         hover:text-neutral-200 px-3 py-1.5"
+            >
+              ERC-8004 Reputation →
+            </a>
+          </div>
+          <div className="mt-4 text-xs text-neutral-500">
+            {"// "}ERC-8004 registered agent #{ERC8004_ID} — Identity + Reputation
+            registries on Arc testnet. Skill score (Murphy 1973) is written to the
+            Reputation Registry as a self-attestation after each resolver run.{" "}
+            <a href="/calibration" className="text-amber-600 hover:text-amber-400">
+              see calibration →
             </a>
           </div>
         </div>
