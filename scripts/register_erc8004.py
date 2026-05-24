@@ -89,7 +89,9 @@ def register(registry_address: str) -> tuple[int, str]:
         "gasPrice": w3.eth.gas_price or 1_000_000,
     })
     signed = account.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    # eth-account 0.11 (web3 6.x) uses rawTransaction; 0.13+ uses raw_transaction
+    raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
+    tx_hash = w3.eth.send_raw_transaction(raw)
     w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
     return agent_id, tx_hash.hex()
 

@@ -105,8 +105,9 @@ def log_prediction_onchain(
         })
 
         signed = account.sign_transaction(tx)
-        # web3 6.x renamed SignedTransaction.rawTransaction -> raw_transaction
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        # eth-account 0.11 (web3 6.x) uses rawTransaction; 0.13+ uses raw_transaction
+        raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
+        tx_hash = w3.eth.send_raw_transaction(raw)
         tx_hex = tx_hash.hex()
         log.info(f"[Oracle] Logged onchain: {tx_hex}")
         return tx_hex
@@ -143,7 +144,9 @@ def resolve_prediction_onchain(condition_id: str, outcome_yes: bool) -> str:
         })
 
         signed = account.sign_transaction(tx)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        # eth-account 0.11 (web3 6.x) uses rawTransaction; 0.13+ uses raw_transaction
+        raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
+        tx_hash = w3.eth.send_raw_transaction(raw)
         tx_hex = tx_hash.hex()
         log.info(f"[Oracle] Resolved onchain: {tx_hex}")
         return tx_hex
