@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import fs from "node:fs";
+import path from "node:path";
 
 export const revalidate = 60; // 1 minute cache
 
@@ -48,6 +50,7 @@ export type MarketIntelligence = {
     divergencePts: number | null;
     arkePosition: "AGREE" | "BULL" | "BEAR" | "DISAGREE" | "NEUTRAL" | null;
     newsContext: string | null;
+    councilForecast: string | null;
     tweetUrl: string | null;
     qualityScore: number | null;
     postedAt: string | null;
@@ -137,6 +140,31 @@ function toCall(c: FeedCall): TrackRecordCall {
     };
 }
 
+// Read the council's tweet text from the pinned reasoning trace, server-side.
+// Trace files live in public/traces/{cid[:16]}.json and are bundled into the
+// route's serverless function via experimental.outputFileTracingIncludes (see
+// next.config.js). The "Bet: …" suffix is stripped — it's a call-to-action,
+// not analysis. Any miss (no file, bad JSON, empty forecast) returns null so
+// the card falls back to the plain @arke_ai link.
+function readCouncilForecast(cid: string): string | null {
+    if (!cid) return null;
+    try {
+        const file = path.join(
+            process.cwd(),
+            "public",
+            "traces",
+            `${cid.slice(0, 16)}.json`
+        );
+        const raw = fs.readFileSync(file, "utf8");
+        const forecast = JSON.parse(raw)?.council_forecast;
+        if (typeof forecast !== "string") return null;
+        const text = forecast.split("Bet:")[0].trim();
+        return text.length > 0 ? text : null;
+    } catch {
+        return null;
+    }
+}
+
 // Server-side fetch of the paid feed. Uses the X-Internal bypass so no x402
 // payment is needed for the dashboard's own calls. Degrades to null on any
 // problem — the dashboard then shows Gamma-only data and never 500s.
@@ -212,6 +240,8 @@ export async function GET() {
               : "thin";
 
             const call = cid ? callsByCid.get(cid) ?? null : null;
+            const councilForecast =
+                call?.reasoningCid ? readCouncilForecast(cid) : null;
             const arkeEstimatePct = call?.arkeProbability ?? null;
             const divergencePts =
                 arkeEstimatePct !== null ? arkeEstimatePct - pct : null;
@@ -236,6 +266,7 @@ export async function GET() {
                 divergencePts,
                 arkePosition,
                 newsContext: null,
+                councilForecast,
                 tweetUrl: call?.xPostUrl ?? null,
                 qualityScore: null,
                 postedAt: call?.postedAt ?? null,

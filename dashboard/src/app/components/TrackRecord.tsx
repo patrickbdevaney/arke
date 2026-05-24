@@ -14,6 +14,8 @@ import type { TrackRecordCall, TrackRecordSummary } from "../api/intelligence/ro
 
 const ARCSCAN = "https://testnet.arcscan.app";
 const POLYGONSCAN = "https://polygonscan.com";
+const ERC8004_REGISTRY = "0x8004A818BFB912233c491871b3d84c89A494BD9e";
+const ORACLE_FALLBACK = "0x767D0eD2850D57C4EF969976088Be44A5Adcfa07";
 
 function CopyButton({ value }: { value: string }) {
     const [copied, setCopied] = useState(false);
@@ -118,34 +120,78 @@ export function TrackRecord({
                         Verify on-chain →
                     </a>
                 )}
+                <a
+                    href={`${ARCSCAN}/address/${ERC8004_REGISTRY}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className={`text-xs text-neutral-500 hover:text-neutral-300 ${oracleContract ? "" : "ml-auto"}`}
+                >
+                    ERC-8004 ID #20360
+                </a>
             </div>
 
+            {/* What the accuracy number means */}
+            {summary && summary.nResolved > 0 && (
+                <div className="text-xs text-neutral-600 font-mono mt-2">
+                    {"// "}directional accuracy (was Arke right?) · on-chain edge accuracy:{" "}
+                    0% (did Arke beat consensus?)
+                    <a
+                        href={`${ARCSCAN}/address/${oracleContract ?? ORACLE_FALLBACK}#readContract`}
+                        className="text-amber-700 hover:text-amber-500 ml-2"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                    >
+                        verify →
+                    </a>
+                </div>
+            )}
+
             {/* Accuracy trajectory */}
-            <div className="mt-5 h-48">
+            <div className="mt-5">
                 {series.length < 3 ? (
-                    <div className="h-full flex items-center justify-center text-neutral-600 text-sm font-mono border border-neutral-800">
-                        Track record building…
+                    <div className="border border-neutral-800 p-3">
+                        <div className="text-xs text-neutral-500 font-mono mb-3">
+                            {"// "}accuracy trajectory — {summary?.nResolved ?? 0} resolved so far
+                        </div>
+                        {calls.filter((c) => c.resolved).map((c) => (
+                            <div
+                                key={c.conditionId}
+                                className="flex justify-between text-xs font-mono py-1 border-b border-neutral-900"
+                            >
+                                <span className="text-neutral-300 truncate max-w-[60%]">
+                                    {(c.question ?? "").slice(0, 55)}
+                                </span>
+                                <span className={c.wasCorrect ? "text-green-400" : "text-red-400"}>
+                                    {c.wasCorrect ? "✓ CORRECT" : "✗ INCORRECT"}
+                                </span>
+                            </div>
+                        ))}
+                        <div className="text-xs text-neutral-600 font-mono mt-2">
+                            chart renders at 3+ resolved markets
+                        </div>
                     </div>
                 ) : (
-                    <ResponsiveContainer width="100%" height="100%">
-                        <LineChart data={series} margin={{ top: 8, right: 16, bottom: 0, left: -16 }}>
-                            <CartesianGrid stroke="#262626" strokeDasharray="3 3" />
-                            <XAxis dataKey="date" stroke="#525252" fontSize={11} />
-                            <YAxis domain={[0, 100]} stroke="#525252" fontSize={11} />
-                            <Tooltip
-                                contentStyle={{ background: "#0a0a0a", border: "1px solid #404040", fontSize: 12 }}
-                                labelStyle={{ color: "#a3a3a3" }}
-                            />
-                            <Line
-                                type="monotone"
-                                dataKey="accuracy"
-                                stroke="#f59e0b"
-                                strokeWidth={2}
-                                dot={{ r: 2 }}
-                                isAnimationActive={false}
-                            />
-                        </LineChart>
-                    </ResponsiveContainer>
+                    <div className="h-48">
+                        <ResponsiveContainer width="100%" height="100%">
+                            <LineChart data={series} margin={{ top: 8, right: 16, bottom: 0, left: -16 }}>
+                                <CartesianGrid stroke="#262626" strokeDasharray="3 3" />
+                                <XAxis dataKey="date" stroke="#525252" fontSize={11} />
+                                <YAxis domain={[0, 100]} stroke="#525252" fontSize={11} />
+                                <Tooltip
+                                    contentStyle={{ background: "#0a0a0a", border: "1px solid #404040", fontSize: 12 }}
+                                    labelStyle={{ color: "#a3a3a3" }}
+                                />
+                                <Line
+                                    type="monotone"
+                                    dataKey="accuracy"
+                                    stroke="#f59e0b"
+                                    strokeWidth={2}
+                                    dot={{ r: 2 }}
+                                    isAnimationActive={false}
+                                />
+                            </LineChart>
+                        </ResponsiveContainer>
+                    </div>
                 )}
             </div>
 
@@ -261,7 +307,15 @@ function ConditionRows({
                 <td className={`py-1.5 px-2 ${posColor}`}>{pos}</td>
                 <td className="py-1.5 px-2 text-neutral-300">{status}</td>
                 <td className={`py-1.5 px-2 text-center ${correctColor}`}>{correct}</td>
-                <td className="py-1.5 pl-2 text-neutral-600">{open ? "▾" : "▸"}</td>
+                <td className="py-1.5 pl-2">
+                    {call.oracleLogTx ? (
+                        <span className="text-amber-500 text-xs border border-amber-800 px-1">
+                            {open ? "hide" : "⛓ onchain"}
+                        </span>
+                    ) : (
+                        <span className="text-neutral-600 text-xs">{open ? "▾" : "▸"}</span>
+                    )}
+                </td>
             </tr>
             {open && (
                 <tr className="bg-neutral-950 border-b border-neutral-900">
