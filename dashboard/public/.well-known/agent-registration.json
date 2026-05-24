@@ -4,14 +4,14 @@
   "version": "2.0.0",
   "agent_type": "forecasting",
   "service_endpoints": {
-    "feed": "http://<placeholder>/v1/arke/track-record",
+    "feed": "http://feed.arke.live:8402/v1/arke/track-record",
     "dashboard": "https://arke.live",
-    "x402_feed": "http://<placeholder>/v1/arke/calls/{condition_id}"
+    "x402_feed": "http://feed.arke.live:8402/v1/arke/calls/{condition_id}"
   },
   "x_handle": "@arke_ai",
-  "oracle_contract": "<placeholder>",
+  "oracle_contract": "0x767D0eD2850D57C4EF969976088Be44A5Adcfa07",
   "oracle_chain": "Arc Testnet (chainId 5042002)",
-  "oracle_explorer": "https://testnet.arcscan.app/address/<placeholder>",
+  "oracle_explorer": "https://testnet.arcscan.app/address/0x767D0eD2850D57C4EF969976088Be44A5Adcfa07",
   "builder_address": "0x310072d29a53aa0650e09628005a4704e9c4b0d0",
   "operating_since": "2026-05-18"
 }
