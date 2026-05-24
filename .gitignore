@@ -32,6 +32,10 @@ dist/
 *.log
 KICKOFF.MD
 
+# Generated full-repo dump — slurps in local-only files (OPERATIONS.local.md,
+# .env), so it can contain the VPS IP, SSH targets, and secrets. Never commit.
+repo_dump.txt
+
 # Generated provenance traces (the .gitkeep tracks the empty dir; sha256 in the
 # DB is the verifiable hash regardless of where the JSON is pinned)
 dashboard/public/traces/*
