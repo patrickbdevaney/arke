@@ -116,14 +116,13 @@ export function TradeWidget({ tokenId, marketPct, arkeEstimate, betUrl }: Props)
                     chainId: POLYGON_CHAIN_ID,
                     verifyingContract: EXCHANGE_ADDR,
                 },
-                message: {
-                    ...order,
-                    tokenId:    parseInt(tokenId),
-                    makerAmount: makerAmt,
-                    takerAmount: takerAmt,
-                    expiration: 0, nonce: 0, feeRateBps: 0,
-                    builder:    "0x" + "0".repeat(64),
-                },
+                // uint256 fields MUST stay decimal strings (as built in `order`).
+                // tokenId is 77 digits — parseInt overflows a JS float to
+                // 7.3e+76, which JSON.stringify emits in scientific notation and
+                // the wallet's uint256 encoder rejects ("Assertion failed", no
+                // prompt). Strings parse to full-precision bigints, mirroring the
+                // Python signer's int(order["tokenId"]).
+                message: { ...order },
             };
 
             // 4. User signs in their wallet — no key ever touches the server
