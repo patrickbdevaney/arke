@@ -1,13 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 
-// User-signed orders are forwarded to the Polymarket CLOB with Arke's builder
-// code injected SERVER-SIDE. The builder code is never exposed to the browser
-// (no NEXT_PUBLIC_) and can't be stripped or swapped client-side. This route
-// never holds a private key — the user already signed the order in their wallet.
+// User-signed orders are forwarded to the Polymarket CLOB verbatim. The builder
+// attribution is part of the SIGNED EIP-712 order, so it is set + signed client
+// side (NEXT_PUBLIC_POLY_BUILDER_CODE) — rewriting it here would change the hash
+// and invalidate the user's signature. The builder code is public (a keccak-
+// encoded address), not a key. This route never holds a private key — the user
+// already signed the order in their wallet.
 
 const CLOB_ORDER_URL = "https://clob.polymarket.com/order";
-const BUILDER_CODE   = (process.env.POLY_BUILDER_CODE ?? "").replace(/^0x/, "")
-                           .padEnd(64, "0").slice(0, 64);
 
 // A thrown value may be a plain object, not an Error — String() on those yields
 // "[object Object]". Extract a readable message before falling back.
@@ -29,13 +29,12 @@ export async function POST(req: NextRequest) {
         if (!order || !signature || !owner)
             return NextResponse.json({ error: "missing fields" }, { status: 400 });
 
-        // Inject builder code server-side — can't be stripped client-side
-        const enriched = { ...order, builder: "0x" + BUILDER_CODE };
-
+        // Forward exactly what was signed — see the note above on why the builder
+        // field can't be rewritten here.
         const resp = await fetch(CLOB_ORDER_URL, {
             method:  "POST",
             headers: { "Content-Type": "application/json" },
-            body:    JSON.stringify({ order: enriched, signature, owner }),
+            body:    JSON.stringify({ order, signature, owner }),
         });
         const data = await resp.json();
         return NextResponse.json(data, { status: resp.status });

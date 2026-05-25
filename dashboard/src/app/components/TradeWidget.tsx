@@ -4,6 +4,15 @@ import { useState } from "react";
 const EXCHANGE_ADDR    = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
 const POLYGON_CHAIN_ID = 137;
 
+// Builder attribution (0.5% fee → Arke). The builder field is part of the SIGNED
+// EIP-712 order, so the client must sign the exact bytes that get submitted — the
+// server cannot rewrite a signed field without invalidating the signature. The
+// builder code is PUBLIC (a keccak-encoded address, submitted in every order; not
+// a credential — the real secrets are POLY_BUILDER_API_KEY/SECRET/PASSPHRASE).
+// Unset → 32 zero-bytes, i.e. a valid but unattributed order (today's behavior).
+const BUILDER_BYTES32 = "0x" + (process.env.NEXT_PUBLIC_POLY_BUILDER_CODE ?? "")
+    .replace(/^0x/, "").padEnd(64, "0").slice(0, 64);
+
 type Side  = "YES" | "NO";
 type Phase = "idle" | "connecting" | "signing" | "submitting" | "success" | "error";
 
@@ -81,8 +90,8 @@ export function TradeWidget({ tokenId, marketPct, arkeEstimate, betUrl }: Props)
                 feeRateBps:  "0",
                 side:        side === "YES" ? 0 : 1,
                 signatureType: 0,
-                // builder injected server-side in /api/trade; zeros here
-                builder:     "0x" + "0".repeat(64),
+                // Signed here (not server-side) — see BUILDER_BYTES32 above.
+                builder:     BUILDER_BYTES32,
             };
 
             // EIP-712 typed data — same domain as the Python side
