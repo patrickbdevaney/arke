@@ -9,6 +9,20 @@ const CLOB_ORDER_URL = "https://clob.polymarket.com/order";
 const BUILDER_CODE   = (process.env.POLY_BUILDER_CODE ?? "").replace(/^0x/, "")
                            .padEnd(64, "0").slice(0, 64);
 
+// A thrown value may be a plain object, not an Error — String() on those yields
+// "[object Object]". Extract a readable message before falling back.
+function errText(e: unknown): string {
+    if (e instanceof Error) return e.message;
+    if (typeof e === "string") return e;
+    if (e && typeof e === "object") {
+        const o = e as Record<string, unknown>;
+        if (typeof o.message === "string") return o.message;
+        if (typeof o.reason  === "string") return o.reason;
+        try { return JSON.stringify(e); } catch { /* fall through */ }
+    }
+    return String(e);
+}
+
 export async function POST(req: NextRequest) {
     try {
         const { order, signature, owner } = await req.json();
@@ -26,6 +40,6 @@ export async function POST(req: NextRequest) {
         const data = await resp.json();
         return NextResponse.json(data, { status: resp.status });
     } catch (e: unknown) {
-        return NextResponse.json({ error: String(e) }, { status: 500 });
+        return NextResponse.json({ error: errText(e) }, { status: 500 });
     }
 }

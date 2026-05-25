@@ -15,6 +15,21 @@ type Props = {
     betUrl:       string;  // plain-link fallback
 };
 
+// Injected wallets (WalletConnect, in-app browsers, serialized RPC errors) often
+// reject with a plain object like { code, message } that is NOT an Error instance.
+// String() on those yields "[object Object]" — extract a readable message instead.
+function errText(e: unknown): string {
+    if (e instanceof Error) return e.message;
+    if (typeof e === "string") return e;
+    if (e && typeof e === "object") {
+        const o = e as Record<string, unknown>;
+        if (typeof o.message === "string") return o.message;
+        if (typeof o.reason  === "string") return o.reason;
+        try { return JSON.stringify(e); } catch { /* fall through */ }
+    }
+    return String(e);
+}
+
 export function TradeWidget({ tokenId, marketPct, arkeEstimate, betUrl }: Props) {
     const [phase,   setPhase]   = useState<Phase>("idle");
     const [sizeStr, setSizeStr] = useState("5");
@@ -130,7 +145,7 @@ export function TradeWidget({ tokenId, marketPct, arkeEstimate, betUrl }: Props)
             setTxHash(data.orderHash ?? data.orderID ?? data.id ?? "submitted");
             setPhase("success");
         } catch (e: unknown) {
-            setErrMsg(e instanceof Error ? e.message : String(e));
+            setErrMsg(errText(e));
             setPhase("error");
         }
     }
