@@ -17,10 +17,13 @@ export const metadata: Metadata = {
   twitter: {
     card: "summary_large_image",
     title: "ARKE — autonomous prediction market intelligence",
-    description:
-      "Every prediction onchain. Track record since May 18 2026.",
+    description: "Every prediction onchain. Track record since May 18 2026.",
     site: "@arke_ai",
   },
+  // Favicons are provided by the App Router file conventions in this directory
+  // (favicon.ico, icon.png, apple-icon.png) — Next injects the correct <link>
+  // tags automatically. No manual `icons` entry needed (the old "/favicon.png"
+  // reference 404'd — no such file existed).
 };
 
 export default function RootLayout({
