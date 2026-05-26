@@ -194,6 +194,90 @@ Operating since 2026-05-18.
 
 ---
 
+## Agent-callable (MCP)
+
+Arke is an MCP server, so other agents — Claude Desktop, Cursor, Cline,
+Continue, or any MCP client — can call its prediction intelligence directly.
+The server (`agent/mcp_server.py`) is a thin transport wrapper over the same DB
+queries, feed helpers, and oracle reads the feed uses; it speaks stdio and logs
+to stderr only. Every tool fails open — an underlying error returns a structured
+error dict, never a crash.
+
+**Eight tools — five free, three paid:**
+
+| Tool | Tier | Returns |
+|---|---|---|
+| `get_latest_call` | free | Most recent calibrated call + onchain tx + reasoning hash |
+| `get_track_record` | free | Count, directional accuracy, Brier skill score, by-category |
+| `get_calibration` | free | 10-bin reliability diagram + dual scores |
+| `verify_onchain` | free | Confirm a `condition_id` was logged onchain before resolution |
+| `list_covered_markets` | free | Markets Arke is covering (calls not yet resolved) |
+| `get_market_intelligence` | **paid ~$0.01** | Full council output + provenance bundle for a market |
+| `get_prediction_bundle` | **paid ~$0.005** | Full provenance bundle by `reasoning_cid` |
+| `request_forecast` | **paid ~$0.05** | Enqueue an on-demand council run; returns a job id |
+
+**Run it:** `pip install -e .` then `arke-mcp` (or `python -m agent.mcp_server`).
+
+**Claude Desktop:** drop `claude_desktop_config.example.json` into your Claude
+Desktop config (renaming to `claude_desktop_config.json`), restart, then ask
+*"What was Arke's latest forecast?"* (free) and *"Get me Arke's full intelligence
+on market X"* (paid). The snippet:
+
+```json
+{
+  "mcpServers": {
+    "arke": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/patrickbdevaney/arke", "arke-mcp"],
+      "env": {
+        "ARKE_FEED_BASE": "https://feed.arke.live:8402",
+        "ARC_RPC_PRIMARY": "https://rpc.testnet.arc.network",
+        "ORACLE_CONTRACT_ADDRESS": "0x767D0eD2850D57C4EF969976088Be44A5Adcfa07"
+      }
+    }
+  }
+}
+```
+
+### Payments — sub-cent USDC, x402-compatible (Circle Nanopayments)
+
+The paid tools and the paid feed endpoints settle in **sub-cent USDC**. The
+gating is the standard x402 402-handshake, with two interchangeable backends
+behind one unified verifier (`agent/payments.py`):
+
+- **Circle Nanopayments via Circle Gateway** (Arc testnet) — x402-compatible:
+  the buyer signs an EIP-3009 authorization, the hosted Gateway facilitator
+  verifies it (canonical x402 v2 `POST /verify` → `isValid`), and batched
+  settlement accrues seller revenue in a Gateway Balance withdrawable to
+  `ARKE_PAYOUT_WALLET`. **Live when `CIRCLE_GATEWAY_FACILITATOR_URL` is set.**
+- **Plain x402** — the existing path. **Used whenever Gateway is unset**, and as
+  an automatic fallback if Gateway verification errors. Nothing hard-breaks.
+
+Honest status: Nanopayments is **dormant until the Gateway env is configured**;
+until then the feed serves the existing x402 path unchanged. There is no new
+contract — Circle's facilitator + Gateway handle settlement and the oracle is
+untouched. Withdrawing the Gateway Balance to the payout wallet is a manual
+operator action (Circle console / script), not automated here.
+
+### A2A demo (record the loop end-to-end)
+
+`demo/a2a_buyer.py` is a standalone buyer agent that spawns the Arke MCP server,
+calls a free tool, then calls a paid tool, signs an EIP-3009 authorization, and
+retries with payment — printing a clean transcript at each step:
+
+```bash
+# From the repo root. The script spawns the MCP server itself.
+python demo/a2a_buyer.py
+```
+
+If `CIRCLE_GATEWAY_FACILITATOR_URL` or `TEST_BUYER_PRIVATE_KEY` is unset, the
+demo runs the free tool, shows the 402 challenge, and prints
+*"paid path skipped — set Gateway env to demo payment"* — it never hard-fails.
+`TEST_BUYER_PRIVATE_KEY` is **local only** (a Gateway-funded test wallet); never
+put it on the VPS and never commit it.
+
+---
+
 ## Verify it yourself
 
 The track record does not depend on trusting Arke's dashboard. The oracle

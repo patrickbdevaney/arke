@@ -929,3 +929,57 @@ class ArkeDB:
             print(f"            {s['last_post_pct']}% | ${s['last_post_vol']:,.0f}/24h")
             print(f"            {s['last_post_at'][:19]} UTC")
         print(f"{'─'*50}\n")
+
+
+# ---------------------------------------------------------------------- #
+# Module-level read helpers                                              #
+#                                                                        #
+# Thin, additive wrappers over ArkeDB so the MCP server (agent/mcp_      #
+# server.py) and any other transport can `from agent.db import ...` a    #
+# plain function instead of carrying an ArkeDB instance. Each opens the  #
+# DB lazily and honours ARKE_DB_PATH (so tests can point at a temp DB),  #
+# exactly like the feed server's per-request `_db()`. No new business    #
+# logic lives here — every function reuses an existing ArkeDB method.    #
+# ---------------------------------------------------------------------- #
+
+
+def _module_db() -> "ArkeDB":
+    """Open the DB lazily. ARKE_DB_PATH overrides the default path."""
+    return ArkeDB(os.getenv("ARKE_DB_PATH") or None)
+
+
+def get_dual_scores() -> dict:
+    """Directional accuracy + Brier skill score for all resolved calls."""
+    return _module_db().get_dual_scores()
+
+
+def get_latest_prediction() -> dict | None:
+    """Arke's most recent call (newest first), or None if there are none."""
+    rows = _module_db().get_track_record(limit=1)
+    return rows[0] if rows else None
+
+
+def get_prediction_by_cid(reasoning_cid: str) -> dict | None:
+    """Look up a call by its provenance bundle CID (`sha256:...`).
+
+    Returns the call record dict, or None if no call carries that cid.
+    """
+    if not reasoning_cid:
+        return None
+    for row in _module_db().get_track_record(limit=1000):
+        if row.get("reasoning_cid") == reasoning_cid:
+            return row
+    return None
+
+
+def list_active_markets() -> list[dict]:
+    """Calls Arke has made on markets that are not yet resolved."""
+    return [r for r in _module_db().get_track_record(limit=1000)
+            if not r.get("resolved")]
+
+
+def get_recent_resolutions(limit: int = 10) -> list[dict]:
+    """The most recent resolved calls (YES/NO outcomes), newest first."""
+    resolved = [r for r in _module_db().get_track_record(limit=1000)
+                if r.get("resolved") and r.get("resolution") in ("YES", "NO")]
+    return resolved[:limit]

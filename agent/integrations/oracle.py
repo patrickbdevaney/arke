@@ -176,3 +176,48 @@ def resolve_prediction_onchain(condition_id: str, outcome_yes: bool) -> str:
     except Exception as e:
         log.warning(f"[Oracle] Failed to resolve onchain: {e} — continuing")
         return ""
+
+
+def read_oracle_event(condition_id: str) -> dict | None:
+    """Read the onchain prediction record for a condition_id (read-only).
+
+    Calls the immutable oracle's `predictions(bytes32)` getter — the same slot
+    logPrediction/resolvePrediction write — and returns the decoded struct.
+    Read-only: NEVER sends a transaction, never touches the contract's state,
+    never needs a private key. Fails open: returns None when the oracle is not
+    configured, the RPC is unreachable, or no record exists for that id.
+
+    Returns a dict (condition_id, question, market_pct, arke_pct, timestamp,
+    resolved, outcome_yes, correct, oracle_contract) or None.
+    """
+    if not condition_id:
+        return None
+    try:
+        w3, contract = _get_web3_and_contract()
+        if not w3 or not contract:
+            return None
+
+        cid_bytes = _condition_id_to_bytes32(condition_id)
+        rec = contract.functions.predictions(cid_bytes).call()
+
+        # predictions(bytes32) -> (conditionId, question, marketPct, arkePct,
+        # timestamp, resolved, outcome, correct). An unwritten slot returns the
+        # zero value: conditionId == 0x000...0 and an empty timestamp.
+        stored_cid = rec[0]
+        if not stored_cid or int.from_bytes(stored_cid, "big") == 0:
+            return None
+
+        return {
+            "condition_id": "0x" + stored_cid.hex() if isinstance(stored_cid, (bytes, bytearray)) else str(stored_cid),
+            "question": rec[1],
+            "market_pct": int(rec[2]),
+            "arke_pct": int(rec[3]),
+            "timestamp": int(rec[4]),
+            "resolved": bool(rec[5]),
+            "outcome_yes": bool(rec[6]),
+            "correct": bool(rec[7]),
+            "oracle_contract": os.getenv("ORACLE_CONTRACT_ADDRESS", "") or None,
+        }
+    except Exception as e:
+        log.warning(f"[Oracle] read_oracle_event failed (returning None): {e}")
+        return None

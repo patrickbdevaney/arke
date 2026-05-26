@@ -27,11 +27,12 @@ import os
 import time
 import logging
 
-import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from agent.db import ArkeDB
+from agent.feed_helpers import build_calibration_payload
+from agent.payments import verify_payment, _verify_x402
 
 log = logging.getLogger(__name__)
 
@@ -56,31 +57,23 @@ def _db() -> ArkeDB:
 
 
 def _verify_payment(proof: str, price: str) -> bool:
-    """Validate an x402 payment proof against the configured facilitator.
-
-    Fail open when no facilitator is configured so local dev works without
-    credentials (per spec); a configured facilitator is actually consulted.
-    """
-    facilitator = os.getenv("X402_FACILITATOR_URL")
-    if not facilitator:
-        log.warning("[feed] X402_FACILITATOR_URL unset — failing open on verify")
-        return True
-    try:
-        r = httpx.post(
-            f"{facilitator.rstrip('/')}/verify",
-            json={"payment": proof, "price": price, "currency": "USDC"},
-            timeout=10.0,
-        )
-        return r.status_code == 200 and bool(r.json().get("valid", False))
-    except Exception as e:
-        log.warning(f"[feed] facilitator verify failed: {e}")
-        return False
+    """Validate an x402 payment proof. Delegates to the unified verifier's x402
+    path (agent/payments.py) so there is a single source of truth; behaviour is
+    unchanged — fail open when no facilitator is configured, otherwise consult
+    it. Kept as a thin wrapper for backward compatibility."""
+    return _verify_x402(proof, price)
 
 
-def _payment_gate(request: Request, price: str):
+def _payment_gate(request: Request, price: str, resource: str = ""):
     """Return None if the request may proceed, else a 402 JSONResponse.
 
     Order: internal dashboard bypass → dev fail-open → payment proof → demand.
+
+    The actual proof check goes through agent.payments.verify_payment, so the
+    feed transparently gains Circle Nanopayments verification when
+    CIRCLE_GATEWAY_FACILITATOR_URL is set and falls back to x402 otherwise. The
+    internal bypass, the dev fail-open, and the 402 response body below are
+    unchanged.
     """
     # Dashboard / server-side bypass.
     if request.headers.get("X-Internal") == "true":
@@ -95,7 +88,8 @@ def _payment_gate(request: Request, price: str):
         return None
 
     proof = request.headers.get("X-Payment")
-    if proof and _verify_payment(proof, price):
+    ok, _challenge = verify_payment(proof, price, resource=resource)
+    if ok:
         return None
 
     return JSONResponse(
@@ -198,7 +192,7 @@ def preview(condition_id: str):
 
 @app.get("/v1/arke/calls/{condition_id}")
 def get_call(condition_id: str, request: Request):
-    gated = _payment_gate(request, PRICE_CALL)
+    gated = _payment_gate(request, PRICE_CALL, resource=f"/v1/arke/calls/{condition_id}")
     if gated is not None:
         return gated
 
@@ -211,27 +205,11 @@ def get_call(condition_id: str, request: Request):
 
 @app.get("/v1/arke/calibration")
 def calibration():
-    """Always free. Calibration data is marketing, never a product to gate."""
-    db = _db()
-    scores = db.get_dual_scores()
-    rows = [r for r in db.get_track_record(limit=1000)
-            if r.get("resolved") and r.get("resolution") in ("YES", "NO")
-            and r.get("arke_probability_pct") is not None]
-    bins = [{"bin": i, "lo": i * 10, "hi": i * 10 + 10, "n": 0, "yes": 0}
-            for i in range(10)]
-    for r in rows:
-        b = min(9, int(r["arke_probability_pct"]) // 10)
-        bins[b]["n"] += 1
-        if r["resolution"] == "YES":
-            bins[b]["yes"] += 1
-    for b in bins:
-        b["empirical_pct"] = (round(100 * b["yes"] / b["n"])
-                              if b["n"] else None)
-    return {"scores": scores, "reliability_bins": bins,
-            "operating_since": OPERATING_SINCE,
-            "note": ("skill_bps measures Arke vs a flat-50% reference — "
-                     "positive means Arke outperformed random. "
-                     "directional_pct measures whether the binary call was right.")}
+    """Always free. Calibration data is marketing, never a product to gate.
+
+    Body is built by agent.feed_helpers.build_calibration_payload() so the MCP
+    server's get_calibration tool returns the exact same shape."""
+    return build_calibration_payload()
 
 
 @app.get("/v1/arke/builder")
@@ -254,7 +232,7 @@ def builder_info():
 
 @app.get("/v1/arke/track-record")
 def track_record(request: Request):
-    gated = _payment_gate(request, PRICE_TRACK_RECORD)
+    gated = _payment_gate(request, PRICE_TRACK_RECORD, resource="/v1/arke/track-record")
     if gated is not None:
         return gated
 

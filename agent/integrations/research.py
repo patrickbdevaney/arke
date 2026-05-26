@@ -1,6 +1,7 @@
 """
 agent/integrations/research.py — per-market targeted web search.
-Tries Brave (BRAVE_API_KEY) first, then Tavily (TAVILY_API_KEY), then ('', []).
+Tries Brave (BRAVE_SEARCH_API_KEY, or the BRAVE_API_KEY alias) first, then
+Tavily (TAVILY_API_KEY), then ('', []).
 Hashes full snippet content for verifiable provenance. Fails open.
 """
 import os
@@ -27,7 +28,9 @@ def research_market(market: dict, max_results: int = 5) -> tuple[str, list]:
     not just the title. Fails open to ('', []) on any error or missing key."""
     query = _build_query(market)
     now = datetime.now(timezone.utc).isoformat()
-    brave_key = os.getenv("BRAVE_API_KEY")
+    # The live .env stores the key as BRAVE_SEARCH_API_KEY; accept the older
+    # BRAVE_API_KEY name too so existing configs/tests keep working.
+    brave_key = os.getenv("BRAVE_SEARCH_API_KEY") or os.getenv("BRAVE_API_KEY")
     tavily_key = os.getenv("TAVILY_API_KEY")
     results = []
 

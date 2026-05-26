@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "arke": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/patrickbdevaney/arke", "arke-mcp"],
+      "env": {
+        "ARKE_FEED_BASE": "https://feed.arke.live:8402",
+        "ARC_RPC_PRIMARY": "https://rpc.testnet.arc.network",
+        "ORACLE_CONTRACT_ADDRESS": "0x767D0eD2850D57C4EF969976088Be44A5Adcfa07"
+      }
+    }
+  }
+}

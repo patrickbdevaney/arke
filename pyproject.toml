@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arke"
+version = "2.0.0"
+description = "Arke — autonomous prediction-market intelligence agent (MCP server + x402/Circle Nanopayments feed)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.8",
+    "httpx>=0.27",
+    "groq>=0.9",
+    "python-dotenv>=1.0",
+    "schedule>=1.2",
+    "web3>=6.20",
+    "tweepy>=4.14",
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.29",
+]
+
+# `arke-mcp` launches the stdio MCP server after `pip install -e .`
+# (also runnable as `python -m agent.mcp_server`).
+[project.scripts]
+arke-mcp = "agent.mcp_server:main"
+
+[tool.setuptools]
+py-modules = ["prove_the_loop"]
+
+[tool.setuptools.packages.find]
+include = ["agent*"]

@@ -159,12 +159,16 @@ def test_get_microstructure_empty_token_all_none():
 # ── per-market research (Brave → Tavily) ────────────────────────────────────
 
 def test_research_market_no_keys_fails_open(monkeypatch):
+    # research.py reads BRAVE_SEARCH_API_KEY first, then the BRAVE_API_KEY alias.
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
     monkeypatch.delenv("BRAVE_API_KEY", raising=False)
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     assert research_market({"question": "Will X happen?"}) == ("", [])
 
 
 def test_research_market_brave_results_hash_full_snippet(monkeypatch):
+    # Exercise the BRAVE_API_KEY alias branch explicitly.
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
     monkeypatch.setenv("BRAVE_API_KEY", "test-key")
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     payload = {"web": {"results": [
