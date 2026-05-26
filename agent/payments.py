@@ -37,12 +37,24 @@ import base64
 import logging
 
 import httpx
+from urllib.parse import urlparse
 
 log = logging.getLogger(__name__)
 
 # USDC has 6 decimals (atomic-unit conversion). Network is Arc testnet in CAIP-2
 # form (chainId 5042002), formed at call time so ARC_CHAIN_ID can be overridden.
 USDC_DECIMALS = 6
+
+# Circle Gateway "exact" scheme metadata (verified live against the hosted
+# facilitator's GET /v1/x402/supported, May 2026): the buyer signs against the
+# GatewayWallet contract domain, not the USDC token. The GatewayWallet address is
+# the same across all Gateway-supported networks. Overridable via env.
+GATEWAY_WALLET_DEFAULT = "0x0077777d7eba4688bdef3e311b846f25870a19b9"
+GATEWAY_SCHEME_NAME = "GatewayWalletBatched"
+GATEWAY_SCHEME_VERSION = "1"
+# Circle's hosted Gateway exposes the x402 facilitator routes under /v1/x402
+# (…/verify, …/settle, …/supported). The bare gateway host 404s on /verify.
+GATEWAY_X402_PATH = "/v1/x402"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -58,6 +70,29 @@ def _facilitator() -> str:
     return _env("CIRCLE_GATEWAY_FACILITATOR_URL")
 
 
+def _gateway_wallet() -> str:
+    return _env("CIRCLE_GATEWAY_WALLET_CONTRACT") or GATEWAY_WALLET_DEFAULT
+
+
+def _facilitator_base() -> str:
+    """The x402 facilitator base to which we append /verify and /settle.
+
+    Canonical x402 clients POST to `{base}/verify`. Circle's Gateway exposes
+    those routes under `/v1/x402`, so if the operator set the bare gateway host
+    (the value Circle's console shows) we normalize it to the x402 base. A URL
+    that already carries an x402 path, or any non-Circle facilitator, is used
+    as-is. Returns '' when no facilitator is configured."""
+    raw = _facilitator().rstrip("/")
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    path = parsed.path.rstrip("/")
+    if "circle.com" in (parsed.netloc or "") and "/x402" not in path:
+        # Bare Circle gateway host (or just /v1) → point at the x402 routes.
+        return f"{parsed.scheme}://{parsed.netloc}{GATEWAY_X402_PATH}"
+    return raw
+
+
 def _atomic(price_usdc: str) -> str:
     """USDC human price -> atomic-unit string (6 decimals). Fails open to '0'."""
     try:
@@ -71,9 +106,24 @@ def _pay_to() -> str:
     return _env("CIRCLE_GATEWAY_SELLER_WALLET") or _env("X402_RECEIVE_ADDRESS")
 
 
-def _requirements(price_usdc: str, resource: str, scheme: str) -> dict:
-    """A single x402 v2 PaymentRequirements entry for one scheme."""
-    req = {
+def _requirements(price_usdc: str, resource: str, scheme: str = "exact") -> dict:
+    """A single x402 v2 PaymentRequirements entry.
+
+    The scheme is x402 "exact" (EIP-3009). When Circle Gateway is configured,
+    `extra` advertises the GatewayWalletBatched metadata Circle's facilitator
+    expects — name/version/verifyingContract (the GatewayWallet) — so a buyer
+    (e.g. Circle's @circle-fin/x402-batching client) signs against the right
+    domain. Without Gateway, `extra` carries plain USDC metadata."""
+    if _facilitator():
+        extra = {
+            "name": GATEWAY_SCHEME_NAME,
+            "version": GATEWAY_SCHEME_VERSION,
+            "verifyingContract": _gateway_wallet(),
+            "human_amount": str(price_usdc),
+        }
+    else:
+        extra = {"name": "USDC", "version": "2", "human_amount": str(price_usdc)}
+    return {
         "scheme": scheme,
         "network": _network(),
         "amount": _atomic(price_usdc),          # atomic units (x402 v2)
@@ -82,17 +132,14 @@ def _requirements(price_usdc: str, resource: str, scheme: str) -> dict:
         "payTo": _pay_to(),
         "resource": resource,
         "maxTimeoutSeconds": 60,
-        "extra": {"name": "USDC", "version": "2", "human_amount": str(price_usdc)},
+        "extra": extra,
     }
-    return req
 
 
 def _challenge(price_usdc: str, resource: str) -> dict:
-    """The HTTP-402 body. Advertises x402 always, plus the Nanopayments/Gateway
-    scheme when a facilitator is configured."""
-    schemes = ["exact"]  # x402 "exact" scheme (EIP-3009)
-    if _facilitator():
-        schemes.append("nanopayments-gateway")
+    """The HTTP-402 body. Advertises the x402 "exact" scheme; when Circle Gateway
+    is configured the requirements carry the GatewayWalletBatched `extra` so the
+    same 402 doubles as a Circle Nanopayments challenge (x402-compatible)."""
     return {
         "x402Version": 2,
         "error": "payment required",
@@ -100,7 +147,8 @@ def _challenge(price_usdc: str, resource: str) -> dict:
         "currency": "USDC",
         "network": _network(),
         "payTo": _pay_to(),
-        "accepts": [_requirements(price_usdc, resource, s) for s in schemes],
+        "gateway": bool(_facilitator()),
+        "accepts": [_requirements(price_usdc, resource, "exact")],
     }
 
 
@@ -136,8 +184,8 @@ def _verify_nanopayments(payment: str, price_usdc: str, resource: str) -> bool:
 
     POSTs the canonical x402 v2 /verify body and treats `isValid`/`valid` true
     as success. Any error -> False (the caller then falls back to x402)."""
-    facilitator = _facilitator()
-    if not facilitator:
+    base = _facilitator_base()
+    if not base:
         return False
     try:
         payload = _decode_payment(payment)
@@ -150,21 +198,20 @@ def _verify_nanopayments(payment: str, price_usdc: str, resource: str) -> bool:
         key = _env("CIRCLE_GATEWAY_API_KEY")
         if key:
             headers["Authorization"] = f"Bearer {key}"
-        r = httpx.post(
-            f"{facilitator.rstrip('/')}/verify",
-            headers=headers,
-            json=body,
-            timeout=10.0,
-        )
+        r = httpx.post(f"{base}/verify", headers=headers, json=body, timeout=10.0)
         if r.status_code != 200:
             log.warning(
-                "[payments] Gateway /verify -> %s (falling back to x402)",
-                r.status_code,
+                "[payments] Gateway %s/verify -> %s: %s (falling back to x402)",
+                base, r.status_code, (r.text or "")[:200],
             )
             return False
         data = r.json()
         # x402 v2 uses `isValid`; some facilitators use `valid`. Accept either.
-        return bool(data.get("isValid", data.get("valid", False)))
+        ok = bool(data.get("isValid", data.get("valid", False)))
+        if not ok:
+            log.warning("[payments] Gateway verify isValid=false: %s",
+                        json.dumps(data)[:200])
+        return ok
     except Exception as e:
         log.warning("[payments] nanopayments verify error (falling back): %s", e)
         return False

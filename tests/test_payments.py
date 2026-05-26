@@ -13,6 +13,8 @@ All network is mocked. Covers:
     X402_FACILITATOR_URL unset; legacy {payment,price,currency} body + `valid`)
 """
 
+import json
+
 import agent.payments as p
 
 
@@ -32,13 +34,18 @@ def test_no_payment_challenge_x402_only(monkeypatch):
     assert challenge["currency"] == "USDC"
 
 
-def test_no_payment_challenge_advertises_nanopayments_when_set(monkeypatch):
+def test_no_payment_challenge_advertises_gateway_scheme_when_set(monkeypatch):
+    # When Circle Gateway is configured, the "exact" requirements carry the
+    # GatewayWalletBatched `extra` (the verified Circle scheme metadata).
     monkeypatch.setenv("CIRCLE_GATEWAY_FACILITATOR_URL", "https://fac.example")
     ok, challenge = p.verify_payment(None, "0.01", "res")
     assert ok is False
-    schemes = [a["scheme"] for a in challenge["accepts"]]
-    assert "exact" in schemes
-    assert "nanopayments-gateway" in schemes
+    assert challenge["gateway"] is True
+    req = challenge["accepts"][0]
+    assert req["scheme"] == "exact"
+    assert req["extra"]["name"] == "GatewayWalletBatched"
+    assert req["extra"]["version"] == "1"
+    assert req["extra"]["verifyingContract"] == p.GATEWAY_WALLET_DEFAULT
 
 
 def test_challenge_amount_is_atomic_usdc(monkeypatch):
@@ -98,6 +105,7 @@ class _Resp:
     def __init__(self, status_code, body):
         self.status_code = status_code
         self._body = body
+        self.text = json.dumps(body)
 
     def json(self):
         return self._body

@@ -91,10 +91,21 @@ def _atomic(price_usdc: str) -> int:
         return 0
 
 
-def build_payment(challenge: dict, private_key: str) -> str | None:
-    """Sign an EIP-3009 TransferWithAuthorization and return the base64 X-PAYMENT
-    header value (an x402 v2 PaymentPayload). Returns None if signing isn't
-    possible. Never raises."""
+# Circle's verified GatewayWalletBatched scheme (GET /v1/x402/supported): the
+# buyer signs an EIP-712 TransferWithAuthorization against the GatewayWallet
+# contract domain (name "GatewayWalletBatched", version "1"), NOT the USDC token.
+GATEWAY_WALLET_DEFAULT = "0x0077777d7eba4688bdef3e311b846f25870a19b9"
+
+
+def build_payment(challenge: dict, private_key: str, resource: str) -> str | None:
+    """Build an x402 v2 PaymentPayload for Circle's GatewayWalletBatched "exact"
+    scheme and return it base64-encoded (the X-PAYMENT header value). Returns
+    None if signing isn't possible. Never raises.
+
+    The payload includes `resource`, `accepted` (the chosen requirements), and
+    `payload.{signature,authorization}` — the exact shape the live facilitator
+    validates. The authorization is a standard EIP-3009 field set, but signed
+    under the GatewayWallet domain advertised in the challenge's `extra`."""
     try:
         from eth_account import Account
     except Exception as e:
@@ -103,21 +114,25 @@ def build_payment(challenge: dict, private_key: str) -> str | None:
 
     try:
         accepts = (challenge.get("accepts") or [{}])[0]
+        extra = accepts.get("extra") or {}
         price = str(challenge.get("price") or accepts.get("maxAmountRequired") or "0.01")
-        pay_to = challenge.get("payTo") or accepts.get("payTo") or ""
-        # USDC contract on Arc testnet = EIP-712 verifyingContract. Operator pins
-        # it; without it the signature can't match the real token domain.
-        verifying_contract = os.getenv("CIRCLE_GATEWAY_USDC_ASSET", "")
-        if not verifying_contract:
-            print("  [skip] CIRCLE_GATEWAY_USDC_ASSET (USDC contract) not set — "
-                  "cannot build a domain-correct EIP-3009 signature")
-            return None
+        pay_to = accepts.get("payTo") or challenge.get("payTo") or ""
+
+        # verifyingContract = the GatewayWallet (from the challenge, else env/default).
+        verifying_contract = (
+            extra.get("verifyingContract")
+            or os.getenv("CIRCLE_GATEWAY_WALLET_CONTRACT")
+            or GATEWAY_WALLET_DEFAULT
+        )
+        domain_name = extra.get("name", "GatewayWalletBatched")
+        domain_version = str(extra.get("version", "1"))
 
         acct = Account.from_key(private_key)
         value = _atomic(price)
         now = int(time.time())
         valid_after = "0"
-        valid_before = str(now + 600)
+        # Honour the scheme's minValiditySeconds (604800 = 7d) with headroom.
+        valid_before = str(now + 700000)
         nonce = "0x" + secrets.token_hex(32)
 
         authorization = {
@@ -148,30 +163,41 @@ def build_payment(challenge: dict, private_key: str) -> str | None:
             },
             "primaryType": "TransferWithAuthorization",
             "domain": {
-                "name": os.getenv("CIRCLE_GATEWAY_USDC_NAME", "USDC"),
-                "version": os.getenv("CIRCLE_GATEWAY_USDC_VERSION", "2"),
+                "name": domain_name,
+                "version": domain_version,
                 "chainId": ARC_CHAIN_ID,
                 "verifyingContract": verifying_contract,
             },
             "message": {
                 "from": acct.address,
                 "to": pay_to,
-                "value": value,
+                "value": int(value),
                 "validAfter": int(valid_after),
                 "validBefore": int(valid_before),
                 "nonce": bytes.fromhex(nonce[2:]),
             },
         }
+        print(f"  signing TransferWithAuthorization under domain "
+              f"{domain_name} v{domain_version} @ {verifying_contract}")
 
         signed = Account.sign_typed_data(private_key, full_message=typed)
         signature = signed.signature.hex()
         if not signature.startswith("0x"):
             signature = "0x" + signature
 
+        # Full x402 v2 PaymentPayload (resource + accepted + payload), the shape
+        # the facilitator's /verify requires.
+        feed_base = os.getenv("ARKE_FEED_BASE", "https://feed.arke.live").rstrip("/")
         payload = {
             "x402Version": 2,
             "scheme": "exact",
             "network": NETWORK,
+            "resource": {
+                "url": f"{feed_base}/mcp/{resource}",
+                "description": f"Arke MCP tool: {resource}",
+                "mimeType": "application/json",
+            },
+            "accepted": accepts,
             "payload": {"signature": signature, "authorization": authorization},
         }
         return base64.b64encode(json.dumps(payload).encode()).decode()
@@ -244,7 +270,7 @@ async def run():
 
             # ---- 3b. Sign EIP-3009 and retry WITH payment ----
             banner("STEP 3 — sign EIP-3009 authorization and retry WITH payment")
-            payment = build_payment(challenge, buyer_key)
+            payment = build_payment(challenge, buyer_key, resource="get_market_intelligence")
             if not payment:
                 print("Could not build a payment — paid path skipped (no hard fail).")
                 return
