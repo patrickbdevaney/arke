@@ -88,6 +88,15 @@ SPORTS_KEYWORDS = [
     "World Series", "Stanley Cup", "NBA Finals",
     "cricket", "rugby", "MLS", "ATP", "WTA",
     "CS2", "CSGO", "Dota 2", "Overwatch", "PUBG",
+    # 2026-05-25 audit (see SPORTS_FILTER_AUDIT.md). The list caught
+    # "Team A vs Team B" via "vs ", but single-team soccer phrasings
+    # ("Will Getafe avoid relegation?", "Juventus to win the league") had no
+    # matching keyword. Add the named clubs plus the leagues/competitions and
+    # major US leagues the live-loop list was missing relative to the helper.
+    "Juventus", "West Ham", "Getafe", "Real Madrid", "Barcelona",
+    "Man City", "Man United", "Bayern", "PSG", "Tottenham", "Chelsea",
+    "Premier League", "La Liga", "Champions League", "Europa League",
+    "NBA", "NFL", "MLB", "NHL", "UFC", "Formula 1", "Grand Prix",
 ]
 
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "arke.live")
@@ -102,6 +111,78 @@ BUILDER_ADDR = os.getenv("POLY_BUILDER_ADDRESS", "")
 
 def is_sports(q: str) -> bool:
     return any(kw.lower() in q.lower() for kw in SPORTS_KEYWORDS)
+
+
+# Market types with no grounded evidence source Arke can cite. The forecaster
+# can only guess at these, the directional filter then blocks the guess, and a
+# whole council cycle's inference budget is wasted. viability_score() screens
+# them out at the selection stage (pick_best_market) before any LLM call.
+NONVIABLE_KEYWORDS = [
+    # celebrity social-media counts / timing — no verifiable historical source
+    "tweet", "retweet", "post on x", "posts on x", "followers",
+    "subscribers", "subscriber count", "tiktok", "instagram",
+    # entertainment niche — box office, music charts, awards, streaming
+    "box office", "rotten tomatoes", "billboard", "spotify", "streams",
+    "grammy", "oscar", "academy award", "emmy", "golden globe", "eurovision",
+    "imdb", "metacritic", "netflix top", "number one single",
+    # celebrity gossip
+    "kardashian", "celebrity", "mrbeast", "mr beast",
+]
+
+
+def viability_score(question: str) -> bool:
+    """Return True only if the market has a grounded evidence source Arke can
+    cite. Returns False for market types with no such source — sports,
+    celebrity tweet/social counts, and entertainment niche (box office, music
+    charts, awards, streaming). Pattern-matches the question text.
+
+    Named "score" for the spec, but it is a boolean predicate: pick_best_market
+    skips any candidate for which it returns False, so the council never runs
+    on a market the forecaster could only speculate about. Conservative by
+    design — it matches phrases tied to ungroundable trivia, not bare topical
+    words, so legitimate crypto/macro/politics/geopolitics markets pass.
+    """
+    q = (question or "").lower()
+    if is_sports(question):
+        return False
+    return not any(kw in q for kw in NONVIABLE_KEYWORDS)
+
+
+def _strongest_evidence(blocks: list[str]) -> str:
+    """Pick the single most citable grounded block for an evidence-anchored
+    reframe (FIX 4). Prefers a MEASURED base rate (real historical frequency),
+    then per-market RESEARCH, then any domain block; ORDERBOOK ranks last
+    because microstructure is the market's own price, not external evidence.
+    Ties break toward the longer (more substantive) block."""
+    if not blocks:
+        return ""
+
+    def rank(b: str) -> int:
+        u = b.upper()
+        if u.startswith("BASE RATE") and "MEASURED" in u:
+            return 4
+        if u.startswith("RESEARCH"):
+            return 3
+        if u.startswith("ORDERBOOK"):
+            return 0
+        return 2
+
+    return max(blocks, key=lambda b: (rank(b), len(b)))
+
+
+def _parse_arke_pct(tweet_text: str, default: int) -> int:
+    """Re-extract Arke's probability from a tweet's 'Arke estimates X%' line.
+    Used after an adversary reframe, which may flip the direction and therefore
+    the number. Falls back to the first percentage on line 2, then to default."""
+    m = re.search(r"[Aa]rke estimates\s*(\d{1,3})\s*%", tweet_text or "")
+    if m:
+        return max(0, min(100, int(m.group(1))))
+    lines = (tweet_text or "").split("\n")
+    if len(lines) >= 2:
+        nums = re.findall(r"(\d{1,3})\s*%", lines[1])
+        if nums:
+            return max(0, min(100, int(nums[0])))
+    return default
 
 
 def get_market_url(market: dict) -> str:
@@ -243,22 +324,31 @@ def market_in_cooldown(m: dict) -> bool:
 
 
 def pick_best_market(feed: list[dict]) -> dict | None:
-    """Pick best market with category diversity.
+    """Pick the best market for the council, applying EVERY skip gate at the
+    selection stage so no inference budget is ever spent on a market that would
+    be dropped downstream:
 
-    Priority order:
-    1. Urgent (ending in 0-7 days), not in cooldown, highest volume
-    2. Medium term (7-30 days), not in cooldown, highest volume
-    3. Any market not in cooldown
-    4. Final fallback: top market regardless of cooldown (with warning)
+      * cooldown (FIX 2) — a market still within its per-category
+        already_posted() window is deduped here, before the council, not after
+        the forecaster has already run.
+      * sports (FIX 1) — is_sports() as defense in depth. fetch_arke_feed()
+        already filters sports, but a sports market must never reach the council
+        even if a new phrasing slips past the feed filter.
+      * viability (FIX 3) — viability_score() drops question types with no
+        grounded evidence source (celebrity tweet counts, entertainment niche).
 
-    Cooldown is per-category (see CATEGORY_COOLDOWN_HOURS): crypto markets
-    resurface after 24h, geopolitics is held 96h.
+    Priority among the surviving candidates (feed is volume-sorted desc):
+      1. Urgent (ending in 0-7 days), highest volume
+      2. Medium term (7-30 days), highest volume
+      3. Any remaining (long-dated)
+
+    Returns None when no candidate survives the gates. main() then distinguishes
+    the 'all in cooldown' case (→ MARKET WATCH) from 'nothing viable' (→ skip).
+    There is deliberately no in-cooldown fallback: re-posting a deduped market
+    is exactly what the cooldown exists to prevent (FIX 2).
     """
     import datetime
     today = datetime.date.today()
-
-    def in_cooldown(m: dict) -> bool:
-        return market_in_cooldown(m)
 
     def days_left(m: dict) -> int:
         try:
@@ -269,30 +359,42 @@ def pick_best_market(feed: list[dict]) -> dict | None:
         except Exception:
             return 999
 
-    # Pass 1: urgent, not in cooldown
-    urgent = [m for m in feed if not in_cooldown(m) and 0 <= days_left(m) <= 7]
+    # Selection-stage gates: cooldown + sports + viability. Filtering here
+    # guarantees the council only ever sees an eligible market.
+    candidates = []
+    for m in feed:
+        q = m.get("question", "")
+        if market_in_cooldown(m):
+            continue
+        if is_sports(q):
+            print(f"      [skip sports] {q[:60]}")
+            continue
+        if not viability_score(q):
+            print(f"      [skip non-viable] {q[:60]}")
+            continue
+        candidates.append(m)
+
+    if not candidates:
+        return None
+
+    # Pass 1: urgent
+    urgent = [m for m in candidates if 0 <= days_left(m) <= 7]
     if urgent:
         selected = urgent[0]
         print(f"      [urgent {days_left(selected)}d] {selected.get('question','')[:60]}")
         return selected
 
-    # Pass 2: medium term, not in cooldown
-    medium = [m for m in feed if not in_cooldown(m) and 7 < days_left(m) <= 30]
+    # Pass 2: medium term
+    medium = [m for m in candidates if 7 < days_left(m) <= 30]
     if medium:
         selected = medium[0]
         print(f"      [medium {days_left(selected)}d] {selected.get('question','')[:60]}")
         return selected
 
-    # Pass 3: any not in cooldown (long-dated)
-    available = [m for m in feed if not in_cooldown(m)]
-    if available:
-        selected = available[0]
-        print(f"      [long-dated] {selected.get('question','')[:60]}")
-        return selected
-
-    # Final fallback: ignore cooldown entirely
-    print("      [WARN] All markets in cooldown — falling back to top market")
-    return feed[0] if feed else None
+    # Pass 3: any remaining (long-dated)
+    selected = candidates[0]
+    print(f"      [long-dated] {selected.get('question','')[:60]}")
+    return selected
 
 
 # ------------------------------------------------------------------ #
@@ -461,6 +563,29 @@ async def main(post: bool | None = None):
     print("\n[2/4] Picking best market...")
     market = pick_best_market(feed)
     if not market:
+        # Every candidate was dropped at the selection stage (cooldown, sports,
+        # or non-viable) — the council never ran, so no inference budget was
+        # spent (FIX 2/3). If the reason is that ALL actionable markets are
+        # within their per-category cooldown, signal MARKET WATCH so the
+        # scheduler posts a 'monitoring' summary instead of nothing; otherwise
+        # record a plain skip.
+        all_cooldown = (
+            DB_AVAILABLE and bool(feed) and all(market_in_cooldown(m) for m in feed)
+        )
+        if all_cooldown:
+            print("      [MARKET WATCH] all markets in cooldown — skipping "
+                  "council, signaling watch summary")
+            duration_ms = int((time.time() - run_start) * 1000)
+            if DB_AVAILABLE:
+                db.record_run(
+                    "skipped",
+                    market_selected="(all markets in cooldown)",
+                    error_message="market_watch_fallback",
+                    duration_ms=duration_ms,
+                )
+            print(f"\nDone. ({duration_ms}ms)")
+            return "all_cooldown"
+
         print("      No suitable market found")
         if DB_AVAILABLE:
             db.record_run("skipped", error_message="no suitable market")
@@ -476,35 +601,15 @@ async def main(post: bool | None = None):
     print(f"      URL: https://{market_url}")
     print(f"      conditionId: {cid[:20]}...")
 
-    # Record skip for markets that lost out to cooldown
+    # Record skip for markets that lost out to cooldown. Cooldown/sports/
+    # viability are all enforced inside pick_best_market now (FIX 2/3), so by
+    # this point `market` is guaranteed eligible and the council can run; this
+    # loop only logs the deduped also-rans for the dashboard.
     if DB_AVAILABLE:
         for m in feed:
             if m.get("conditionId") != cid:
                 if market_in_cooldown(m):
                     db.record_skip(m, "category_cooldown")
-
-    # ── MARKET WATCH detection ─────────────────────────────────────
-    # If every actionable market is within its per-category cooldown, then
-    # pick_best_market returned the stale top-market fallback. Re-running the
-    # full council on a stale market produces a near-duplicate post; instead
-    # signal the caller (the scheduler) to post a MARKET WATCH summary. Returns
-    # before the council runs so no LLM budget is spent on a stale market.
-    all_cooldown = (
-        DB_AVAILABLE and bool(feed) and all(market_in_cooldown(m) for m in feed)
-    )
-    if all_cooldown:
-        print("      [MARKET WATCH] all markets in cooldown — skipping council, "
-              "signaling watch summary")
-        duration_ms = int((time.time() - run_start) * 1000)
-        if DB_AVAILABLE:
-            db.record_run(
-                "skipped",
-                market_selected="(all markets in cooldown)",
-                error_message="market_watch_fallback",
-                duration_ms=duration_ms,
-            )
-        print(f"\nDone. ({duration_ms}ms)")
-        return "all_cooldown"
 
     # ── 2.5: Signal Agent ─────────────────────────────────────────────
     print("\n[2.5/4] Signal Agent — aggregating context...")
@@ -690,12 +795,41 @@ async def main(post: bool | None = None):
     edge = arke_pct - market_pct
     position = "AGREE" if abs(edge) <= 3 else ("BULL" if edge > 0 else "BEAR")
 
+    # ── FIX 4: evidence-anchored reframe before giving up ──────────────
+    # The forecaster's framing failed the directional filter 3x — its cited
+    # reason didn't argue for its estimate. Rather than burn the whole cycle,
+    # hand the strongest grounded evidence block to the adversary and let it
+    # rebuild the call around what the evidence actually supports (it may flip
+    # the direction). Then re-run the filter ONCE. Only exit if that also fails.
     if not filter_passed:
-        print(f"      BLOCKED after 3 attempts — skipping post")
+        evidence = _strongest_evidence(grounded_blocks)
+        if evidence:
+            print("      BLOCKED after 3 attempts — attempting evidence-anchored "
+                  "reframe")
+            from agent.agents.adversary_agent import reframe_around_evidence
+            reframed, ok = reframe_around_evidence(
+                tweet, market, market_url, evidence)
+            if ok and reframed and reframed.strip() != tweet.strip():
+                tweet = reframed
+                # The reframe may have flipped the direction — re-derive Arke's
+                # estimate from the new tweet before re-scoring.
+                arke_pct = _parse_arke_pct(tweet, arke_pct)
+                edge = arke_pct - market_pct
+                position = "AGREE" if abs(edge) <= 3 else ("BULL" if edge > 0 else "BEAR")
+                print(f"      Reframed: Arke={arke_pct}% Edge={edge:+d}pts {position}")
+                filter_score, filter_passed, filter_reason = quality_check(tweet, market)
+                print(f"      Reframe filter: score={filter_score:.2f} "
+                      f"passed={filter_passed} | {filter_reason}")
+        else:
+            print("      BLOCKED after 3 attempts — no grounded evidence to "
+                  "reframe around")
+
+    if not filter_passed:
+        print(f"      BLOCKED after reframe — skipping post")
         if DB_AVAILABLE:
             db.record_run("skipped",
                 market_selected=market.get("question", ""),
-                error_message=f"quality_blocked: {filter_reason}")
+                error_message=f"quality_blocked_after_reframe: {filter_reason}")
         print("\nDone.")
         return
 

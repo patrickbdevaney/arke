@@ -91,3 +91,87 @@ Respond with ONLY "PASS" or "REWRITE: [corrected tweet]" — nothing else."""
     except Exception as e:
         log.warning(f"[Adversary] Failed: {e} — passing original")
         return tweet, True
+
+
+def reframe_around_evidence(
+    tweet: str,
+    market: dict,
+    market_url: str,
+    evidence: str,
+) -> tuple[str, bool]:
+    """Last-resort reframe after the quality filter blocks the forecaster's
+    call 3 times.
+
+    Rather than abandoning the cycle, hand the adversary the single strongest
+    grounded evidence block and instruct it to rebuild the call around what that
+    evidence actually supports — flipping the directional claim (and the % ) if
+    the evidence points the other way. The original forecaster framing was
+    rejected as a non-sequitur; here the evidence drives the direction instead
+    of the other way around.
+
+    Returns (reframed_tweet, ok). ok=False (and the original tweet) when there is
+    no key, no evidence, or no usable rewrite — the caller then re-runs the
+    quality filter on the result and only exits if that also fails.
+    """
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key or not evidence:
+        return tweet, False
+
+    question = market.get("question", "")
+    market_pct = int(float(market.get("lastTradePrice", 0)) * 100)
+
+    prompt = f"""You are Arke's adversarial editor. A prediction-market tweet was
+REJECTED by the quality filter because its cited reason did not actually argue
+for its probability estimate (a non-sequitur). Do not defend the old framing.
+Rebuild the call from the grounded evidence below.
+
+Market: {question}
+Market probability: {market_pct}% YES
+
+GROUNDED EVIDENCE (the only verifiable source available — anchor on this):
+{evidence}
+
+REJECTED tweet:
+{tweet}
+
+Your task:
+1. Read what the grounded evidence ACTUALLY supports about this market.
+2. Pick the probability the evidence points to. You MAY flip the direction of
+   the original call if the evidence contradicts it — follow the evidence, not
+   the old tweet.
+3. Write a NEW 3-line tweet whose line-2 reason is drawn directly from the
+   evidence, so the cited fact plainly implies the estimate's direction.
+
+FORMAT (follow exactly):
+Line 1: State the market and the market's probability as fact. One sentence.
+Line 2: "Arke estimates [X]% — " then ONE specific fact from the evidence that
+        directly implies X. No vague patterns. No analogies to unrelated events.
+Line 3: "Bet: {market_url}"
+
+Under 260 characters. No hashtags, emojis, or exclamation marks.
+Respond with ONLY the 3-line tweet — nothing else."""
+
+    try:
+        client = Groq(api_key=api_key)
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            # qwen3-32b is a reasoning model; leave room for thinking + tweet.
+            max_tokens=1024,
+        )
+        result = (response.choices[0].message.content or "").strip()
+        result = re.sub(r"<think>[\s\S]*?</think>", "", result, flags=re.IGNORECASE).strip()
+        # Strip a leading "TWEET:" label if the model adds one.
+        if result.upper().startswith("TWEET:"):
+            result = result[6:].strip()
+
+        if len(result) > 20 and "Bet:" in result:
+            log.info("[Adversary] Evidence-anchored reframe produced a new call")
+            return result, True
+        log.warning("[Adversary] Reframe malformed — keeping original")
+        return tweet, False
+
+    except Exception as e:
+        log.warning(f"[Adversary] Reframe failed: {e} — keeping original")
+        return tweet, False

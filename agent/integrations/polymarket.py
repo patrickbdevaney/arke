@@ -43,6 +43,11 @@ SPORTS_KEYWORDS = [
     "Mets", "Cubs", "Padres", "Giants", "NBA", "NFL", "MLB", "NHL",
     "UFC", "Formula 1", "F1 ", "Grand Prix", "Champions League",
     "Premier League", "La Liga", "Bundesliga", "Serie A",
+    # 2026-05-25 audit: named soccer clubs single-team phrasings missed
+    # (see SPORTS_FILTER_AUDIT.md). Kept in sync with prove_the_loop.py.
+    "Juventus", "West Ham", "Getafe", "Real Madrid", "Barcelona",
+    "Man City", "Man United", "Bayern", "PSG", "Tottenham", "Chelsea",
+    "Europa League",
 ]
 
 
