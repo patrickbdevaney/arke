@@ -88,18 +88,23 @@ def _payment_gate(request: Request, price: str, resource: str = ""):
         return None
 
     proof = request.headers.get("X-Payment")
-    ok, _challenge = verify_payment(proof, price, resource=resource)
+    ok, challenge = verify_payment(proof, price, resource=resource)
     if ok:
         return None
 
+    # Surface the x402-compliant challenge verify_payment built — it advertises
+    # the "exact" scheme (and Circle Gateway's GatewayWalletBatched `extra` when a
+    # facilitator is configured) so real x402 / Nanopayments buyers can discover
+    # how to pay. Keep the legacy `recipient` field + the X-* headers so existing
+    # readers (and the dashboard's server-side fetch) are unaffected.
+    body = dict(challenge) if isinstance(challenge, dict) else {}
+    body.setdefault("error", "payment required")
+    body.setdefault("price", str(price))
+    body.setdefault("currency", "USDC")
+    body["recipient"] = receive
     return JSONResponse(
         status_code=402,
-        content={
-            "error": "payment required",
-            "price": price,
-            "currency": "USDC",
-            "recipient": receive,
-        },
+        content=body,
         headers={
             "X-Payment-Required": "true",
             "X-Price": str(price),

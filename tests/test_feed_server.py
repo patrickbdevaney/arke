@@ -64,6 +64,21 @@ def test_calls_402_when_receive_address_set_and_no_payment(seeded_db, monkeypatc
     assert r.headers.get("X-Recipient") == "0xRecipientAddress"
 
 
+def test_402_body_advertises_x402_accepts_challenge(seeded_db, monkeypatch):
+    """The 402 body is a spec-compliant x402 challenge: it advertises the
+    'exact' scheme in `accepts` (so real x402/Nanopayments buyers can pay) while
+    keeping the legacy `recipient` field for backward compatibility."""
+    monkeypatch.setenv("X402_RECEIVE_ADDRESS", "0xRecipientAddress")
+    monkeypatch.delenv("INTERNAL_SECRET", raising=False)
+    r = client.get("/v1/arke/track-record")
+    assert r.status_code == 402
+    body = r.json()
+    assert body["recipient"] == "0xRecipientAddress"   # legacy field preserved
+    assert body["x402Version"] == 2
+    schemes = [a.get("scheme") for a in body.get("accepts", [])]
+    assert "exact" in schemes
+
+
 def test_calls_fail_open_when_no_receive_address(seeded_db, monkeypatch):
     monkeypatch.delenv("X402_RECEIVE_ADDRESS", raising=False)
     r = client.get(f"/v1/arke/calls/{seeded_db}")
